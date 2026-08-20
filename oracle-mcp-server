@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "oracle-db": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\purnajo\\Documents\\oracle-mcp-server\\server.py"
+      ],
+      "env": {
+        "ORACLE_PASSWORD": "Welocem_54321"
+      }
+    }
+  }
+}

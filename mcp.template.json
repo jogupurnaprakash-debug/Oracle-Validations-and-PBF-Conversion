@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "oracle-rbm": {
+      "command": "C:/Users/purnajo/Documents/oracle-mcp-server/.venv/Scripts/python.exe",
+      "args": ["C:/Users/purnajo/Documents/oracle-mcp-server/server.py"],
+      "env": {
+        "ORACLE_HOST": "your-oracle-host",
+        "ORACLE_PORT": "1521",
+        "ORACLE_SERVICE": "your-rbm-service",
+        "ORACLE_USER": "your-username",
+        "ORACLE_PASSWORD": "your-rbm-password"
+      }
+    },
+    "oracle-ubsr": {
+      "command": "C:/Users/purnajo/Documents/oracle-mcp-server/.venv/Scripts/python.exe",
+      "args": ["C:/Users/purnajo/Documents/oracle-mcp-server/server.py"],
+      "env": {
+        "ORACLE_HOST": "your-oracle-host",
+        "ORACLE_PORT": "1521",
+        "ORACLE_SERVICE": "your-ubsr-service",
+        "ORACLE_USER": "your-username",
+        "ORACLE_PASSWORD": "your-ubsr-password"
+      }
+    }
+  }
+}

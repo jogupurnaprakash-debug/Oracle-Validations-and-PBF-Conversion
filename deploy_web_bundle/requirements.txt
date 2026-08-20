@@ -1,0 +1,4 @@
+mcp>=0.1.0
+oracledb>=1.4.0
+python-dotenv>=1.0.0
+streamlit>=1.57.0

@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "oracle-rbm": {
+      "command": "C:/Users/purnajo/Documents/oracle-mcp-server/.venv/Scripts/python.exe",
+      "args": ["C:/Users/purnajo/Documents/oracle-mcp-server/server.py"],
+      "env": {
+        "ORACLE_HOST": "tpaldiipvd047scan.ebiz.verizon.com",
+        "ORACLE_PORT": "2056",
+        "ORACLE_SERVICE": "r2w1st011",
+        "ORACLE_USER": "purnajo",
+        "ORACLE_PASSWORD": "${ORACLE_RBM_PASSWORD}"
+      }
+    },
+    "oracle-ubsr": {
+      "command": "C:/Users/purnajo/Documents/oracle-mcp-server/.venv/Scripts/python.exe",
+      "args": ["C:/Users/purnajo/Documents/oracle-mcp-server/server.py"],
+      "env": {
+        "ORACLE_HOST": "tpaldiipvd047scan.ebiz.verizon.com",
+        "ORACLE_PORT": "2056",
+        "ORACLE_SERVICE": "ub2wst011",
+        "ORACLE_USER": "purnajo",
+        "ORACLE_PASSWORD": "${ORACLE_UBSR_PASSWORD}"
+      }
+    }
+  }
+}
