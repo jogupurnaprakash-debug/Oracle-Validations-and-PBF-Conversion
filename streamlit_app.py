@@ -310,10 +310,34 @@ def _mainframe_copybook_candidates(dataset_name: str, explicit_copybook: str = "
     return deduped
 
 
+def _mainframe_dataset_name_variants(dataset_name: str) -> list[str]:
+    raw = dataset_name.strip()
+    if not raw:
+        return []
+
+    unquoted = raw.strip("'").strip('"')
+    upper = unquoted.upper()
+    variants = [raw, unquoted, upper, f"'{unquoted}'", f"'{upper}'"]
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for name in variants:
+        token = name.strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(token)
+    return deduped
+
+
 def _mainframe_operation_argument_variants(
     operation: str,
     data: str,
     dataset_copybook: str = "",
+    dataset_volser: str = "",
 ) -> list[dict[str, Any]]:
     normalized = data.strip()
     if not normalized:
@@ -396,28 +420,38 @@ def _mainframe_operation_argument_variants(
         )
     elif operation == "View Dataset":
         copybook_candidates = _mainframe_copybook_candidates(normalized, dataset_copybook)
-        variants.extend(
-            [
+        dataset_name_variants = _mainframe_dataset_name_variants(normalized)
+        volser = dataset_volser.strip()
+
+        for dsn in dataset_name_variants:
+            base_payloads = [
                 {
                     "mode": "submit_dataset",
                     "operation": "View Dataset",
-                    "dataset": normalized,
-                    "data": normalized,
+                    "dataset": dsn,
+                    "data": dsn,
                     "environment": MAINFRAME_ENV,
                 },
                 {
                     "mode": "submit_and_wait",
                     "operation": "View Dataset",
-                    "dataset": normalized,
-                    "data": normalized,
+                    "dataset": dsn,
+                    "data": dsn,
                     "environment": MAINFRAME_ENV,
                 },
-                {"mode": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
-                {"mode": "submit_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
-                {"action": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
-                {"operation": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
+                {"mode": "submit_dataset", "dataset": dsn, "environment": MAINFRAME_ENV},
+                {"mode": "submit_dataset", "dataSetName": dsn, "environment": MAINFRAME_ENV},
+                {"mode": "submit_dataset", "dsn": dsn, "environment": MAINFRAME_ENV},
+                {"mode": "view_dataset", "dataset": dsn, "environment": MAINFRAME_ENV},
+                {"action": "view_dataset", "dataset": dsn, "environment": MAINFRAME_ENV},
+                {"operation": "view_dataset", "dataset": dsn, "environment": MAINFRAME_ENV},
             ]
-        )
+
+            if volser:
+                for payload in base_payloads:
+                    payload["volser"] = volser
+
+            variants.extend(base_payloads)
 
         # Add copybook-aware variants so different files can be decoded correctly.
         for copybook_name in copybook_candidates:
@@ -425,25 +459,29 @@ def _mainframe_operation_argument_variants(
                 [
                     {
                         "mode": "submit_dataset",
-                        "dataset": normalized,
+                        "dataset": dataset_name_variants[0] if dataset_name_variants else normalized,
                         "copybook": copybook_name,
                         "environment": MAINFRAME_ENV,
                     },
                     {
                         "mode": "submit_dataset",
-                        "dataset": normalized,
+                        "dataset": dataset_name_variants[0] if dataset_name_variants else normalized,
                         "copybook_name": copybook_name,
                         "environment": MAINFRAME_ENV,
                     },
                     {
                         "mode": "submit_and_wait",
                         "operation": "View Dataset",
-                        "dataset": normalized,
+                        "dataset": dataset_name_variants[0] if dataset_name_variants else normalized,
                         "copybook": copybook_name,
                         "environment": MAINFRAME_ENV,
                     },
                 ]
             )
+
+            if volser:
+                for payload in variants[-3:]:
+                    payload["volser"] = volser
 
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -980,6 +1018,7 @@ def _mainframe_execute(
     tool_name: str = "",
     available_tools: list[str] | None = None,
     dataset_copybook: str = "",
+    dataset_volser: str = "",
 ) -> dict[str, Any]:
     if not session_id.strip():
         return {
@@ -991,7 +1030,12 @@ def _mainframe_execute(
         }
 
     payload = _mainframe_payload(operation, data)
-    argument_variants = _mainframe_operation_argument_variants(operation, data, dataset_copybook=dataset_copybook)
+    argument_variants = _mainframe_operation_argument_variants(
+        operation,
+        data,
+        dataset_copybook=dataset_copybook,
+        dataset_volser=dataset_volser,
+    )
     attempts: list[tuple[str, dict[str, Any], str, str]] = [
         ("mainframe.execute", payload, "mf-op-1", ""),
         ("execute", payload, "mf-op-2", ""),
@@ -1374,6 +1418,12 @@ def render_mainframe_operations_tab() -> None:
                 placeholder="AUTO from input file name or provide explicit copybook",
                 disabled=ops_disabled,
             )
+            st.text_input(
+                "Volume Serial (optional)",
+                key="mf_dataset_volser",
+                placeholder="e.g. TGU036",
+                disabled=ops_disabled,
+            )
             st.caption("Tip: Set MAINFRAME_COPYBOOK_MAP in env as JSON, e.g. {\"ALL\":\"SVCPRD_COPYBOOK\"} for auto file-to-copybook mapping.")
 
         action_label = operation_to_button.get(operation, "Execute")
@@ -1413,6 +1463,7 @@ def render_mainframe_operations_tab() -> None:
                     st.session_state.get("mf_tool_name", ""),
                     st.session_state.get("mf_available_tools", []),
                     st.session_state.get("mf_dataset_copybook", ""),
+                    st.session_state.get("mf_dataset_volser", ""),
                 )
                 st.session_state.mf_last_result = result
 
