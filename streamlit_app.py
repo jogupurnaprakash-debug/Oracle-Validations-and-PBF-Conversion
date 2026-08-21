@@ -214,6 +214,41 @@ def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
     return {"operation": operation, "data": data}
 
 
+def _mainframe_jsonrpc_message(method: str, params: dict[str, Any], request_id: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    }
+
+
+def _extract_jsonrpc_error_message(body: Any) -> str:
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message.strip():
+                return message
+    return ""
+
+
+def _mainframe_post_jsonrpc(
+    user_id: str,
+    password: str,
+    method: str,
+    params: dict[str, Any],
+    request_id: str,
+    timeout: int,
+) -> requests.Response:
+    return requests.post(
+        MAINFRAME_API_URL,
+        headers=_mainframe_headers(user_id, password),
+        json=_mainframe_jsonrpc_message(method, params, request_id),
+        timeout=timeout,
+    )
+
+
 def _mainframe_coerce_dataframe(response_json: Any) -> pd.DataFrame | None:
     if isinstance(response_json, list):
         if response_json and all(isinstance(item, dict) for item in response_json):
@@ -290,59 +325,110 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
 
 
 def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -> dict[str, Any]:
-    try:
-        response = requests.post(
-            MAINFRAME_API_URL,
-            headers=_mainframe_headers(user_id, password),
-            json=_mainframe_payload(operation, data),
-            timeout=120,
-        )
-    except requests.exceptions.RequestException as exc:
-        return {
-            "ok": False,
-            "status_code": None,
-            "response_json": None,
-            "raw_text": "",
-            "error": f"Network error calling mainframe API: {exc}",
-        }
+    attempts: list[tuple[str, dict[str, Any], str]] = [
+        ("mainframe.execute", _mainframe_payload(operation, data), "mf-op-1"),
+        ("execute", _mainframe_payload(operation, data), "mf-op-2"),
+        ("run_operation", _mainframe_payload(operation, data), "mf-op-3"),
+        (
+            "tools/call",
+            {
+                "name": os.getenv("MAINFRAME_TOOL_NAME", "mainframe_operations"),
+                "arguments": _mainframe_payload(operation, data),
+            },
+            "mf-op-4",
+        ),
+    ]
 
-    response_json = _mainframe_safe_json(response)
-    raw_text = response.text or ""
+    last_response: requests.Response | None = None
+    last_json: Any | None = None
+    last_raw_text = ""
+    last_error_text = ""
 
-    if response.status_code == 401:
+    for method, params, request_id in attempts:
+        try:
+            response = _mainframe_post_jsonrpc(
+                user_id=user_id,
+                password=password,
+                method=method,
+                params=params,
+                request_id=request_id,
+                timeout=120,
+            )
+        except requests.exceptions.RequestException as exc:
+            return {
+                "ok": False,
+                "status_code": None,
+                "response_json": None,
+                "raw_text": "",
+                "error": f"Network error calling mainframe API: {exc}",
+            }
+
+        response_json = _mainframe_safe_json(response)
+        raw_text = response.text or ""
+
+        last_response = response
+        last_json = response_json
+        last_raw_text = raw_text
+
+        if response.status_code == 401:
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "response_json": response_json,
+                "raw_text": raw_text,
+                "error": "Unauthorized: invalid TSO credentials.",
+            }
+
+        if not response.ok:
+            last_error_text = _extract_jsonrpc_error_message(response_json)
+            continue
+
+        # HTTP is OK; JSON-RPC may still return an error object.
+        jsonrpc_error = _extract_jsonrpc_error_message(response_json)
+        if jsonrpc_error:
+            last_error_text = jsonrpc_error
+            method_not_found = "method not found" in jsonrpc_error.lower()
+            invalid_params = "invalid params" in jsonrpc_error.lower()
+            if method_not_found or invalid_params:
+                continue
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "response_json": response_json,
+                "raw_text": raw_text,
+                "error": jsonrpc_error,
+            }
+
+        # JSON-RPC success typically returns result.
+        success_body = response_json.get("result") if isinstance(response_json, dict) else response_json
         return {
-            "ok": False,
+            "ok": True,
             "status_code": response.status_code,
-            "response_json": response_json,
+            "response_json": success_body,
             "raw_text": raw_text,
-            "error": "Unauthorized: invalid TSO credentials.",
+            "error": "",
         }
 
-    if not response.ok:
-        return {
-            "ok": False,
-            "status_code": response.status_code,
-            "response_json": response_json,
-            "raw_text": raw_text,
-            "error": f"Mainframe API returned HTTP {response.status_code}.",
-        }
-
+    status_code = last_response.status_code if last_response is not None else None
+    fallback_error = last_error_text or (f"Mainframe API returned HTTP {status_code}." if status_code else "Mainframe API request failed.")
     return {
-        "ok": True,
-        "status_code": response.status_code,
-        "response_json": response_json,
-        "raw_text": raw_text,
-        "error": "",
+        "ok": False,
+        "status_code": status_code,
+        "response_json": last_json,
+        "raw_text": last_raw_text,
+        "error": fallback_error,
     }
 
 
 def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str]:
     """Attempt a lightweight API call to verify TSO credentials/session readiness."""
     try:
-        response = requests.post(
-            MAINFRAME_API_URL,
-            headers=_mainframe_headers(user_id, password),
-            json=_mainframe_payload("PING", "health_check"),
+        response = _mainframe_post_jsonrpc(
+            user_id=user_id,
+            password=password,
+            method="tools/list",
+            params={},
+            request_id="mf-connect",
             timeout=30,
         )
     except requests.exceptions.RequestException as exc:
@@ -351,11 +437,15 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str]:
     if response.status_code == 401:
         return False, "Unauthorized: invalid TSO credentials."
 
-    # Some backends may reject PING as unsupported/not acceptable but still confirm auth/session.
+    # Some gateways reject tools/list but still prove reachability/auth on these status codes.
     if response.status_code in {400, 404, 405, 406}:
         return True, "Connected to TSO gateway."
 
     if response.ok:
+        body = _mainframe_safe_json(response)
+        jsonrpc_error = _extract_jsonrpc_error_message(body)
+        if jsonrpc_error:
+            return False, jsonrpc_error
         return True, "Connected to TSO gateway."
 
     return False, f"Connection failed with HTTP {response.status_code}."
