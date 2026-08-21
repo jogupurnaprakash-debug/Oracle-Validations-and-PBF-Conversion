@@ -13,11 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import oracledb
+import oracledb  # type: ignore[reportMissingImports]
 import pandas as pd
 import requests
 import streamlit as st
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # type: ignore[reportMissingImports]
 
 try:
     import paramiko
