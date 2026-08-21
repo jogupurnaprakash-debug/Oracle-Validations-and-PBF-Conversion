@@ -234,6 +234,20 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
     if operation == "Run SPUFI Query":
         variants.extend(
             [
+                {
+                    "mode": "submit_inline",
+                    "operation": "Run SPUFI Query",
+                    "data": normalized,
+                    "sql": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
+                {
+                    "mode": "submit_and_wait",
+                    "operation": "Run SPUFI Query",
+                    "data": normalized,
+                    "sql": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
                 {"mode": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
                 {"mode": "spufi", "query": normalized, "environment": MAINFRAME_ENV},
                 {"action": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
@@ -243,6 +257,20 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
     elif operation == "Validate Table":
         variants.extend(
             [
+                {
+                    "mode": "submit_inline",
+                    "operation": "Validate Table",
+                    "data": normalized,
+                    "table": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
+                {
+                    "mode": "submit_and_wait",
+                    "operation": "Validate Table",
+                    "data": normalized,
+                    "table": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
                 {"mode": "validate_table", "table": normalized, "environment": MAINFRAME_ENV},
                 {"mode": "validate", "table_name": normalized, "environment": MAINFRAME_ENV},
                 {"operation": "validate_table", "table": normalized, "environment": MAINFRAME_ENV},
@@ -251,6 +279,20 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
     elif operation == "Submit JCL":
         variants.extend(
             [
+                {
+                    "mode": "submit_inline",
+                    "operation": "Submit JCL",
+                    "data": normalized,
+                    "jcl": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
+                {
+                    "mode": "submit_and_wait",
+                    "operation": "Submit JCL",
+                    "data": normalized,
+                    "jcl": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
                 {"mode": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
                 {"action": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
                 {"operation": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
@@ -259,6 +301,20 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
     elif operation == "View Dataset":
         variants.extend(
             [
+                {
+                    "mode": "submit_dataset",
+                    "operation": "View Dataset",
+                    "dataset": normalized,
+                    "data": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
+                {
+                    "mode": "submit_and_wait",
+                    "operation": "View Dataset",
+                    "dataset": normalized,
+                    "data": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
                 {"mode": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
                 {"mode": "submit_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
                 {"action": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
@@ -742,6 +798,7 @@ def _mainframe_execute(
                     or "missing" in lower_error
                     or "invalid" in lower_error
                     or "parameter" in lower_error
+                    or "unknown mode" in lower_error
                 )
                 if method == "tools/call" and attempted_tool_name and retryable_embedded:
                     continue
