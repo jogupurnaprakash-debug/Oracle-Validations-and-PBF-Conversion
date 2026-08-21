@@ -243,6 +243,47 @@ def _mainframe_safe_json(resp: requests.Response) -> Any | None:
         return None
 
 
+def _mainframe_operation_prefers_table(operation: str) -> bool:
+    return operation in {"Run SPUFI Query", "Validate Table"}
+
+
+def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
+    st.divider()
+    st.subheader("API response")
+
+    if not result.get("ok"):
+        st.error(result.get("error") or "Mainframe API request failed.")
+        if result.get("status_code") is not None:
+            st.caption(f"HTTP status: {result.get('status_code')}")
+        if result.get("raw_text"):
+            st.code(result.get("raw_text"), language="text")
+        if result.get("response_json") is not None:
+            st.json(result.get("response_json"))
+        return
+
+    response_json = result.get("response_json")
+    raw_text = (result.get("raw_text") or "").strip()
+    table_df = _mainframe_coerce_dataframe(response_json)
+
+    if _mainframe_operation_prefers_table(operation) and table_df is not None and not table_df.empty:
+        st.dataframe(table_df)
+        return
+
+    if isinstance(response_json, (dict, list)):
+        if table_df is not None and not table_df.empty and not _mainframe_operation_prefers_table(operation):
+            with st.container(border=True):
+                st.caption("Structured response")
+                st.dataframe(table_df)
+        else:
+            st.json(response_json)
+        return
+
+    if raw_text:
+        st.code(raw_text, language="text")
+    else:
+        st.info("No response body returned.")
+
+
 def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -> dict[str, Any]:
     try:
         response = requests.post(
@@ -396,31 +437,7 @@ def render_mainframe_operations_tab() -> None:
 
     result = st.session_state.get("mf_last_result")
     if result:
-        st.divider()
-        st.subheader("API response")
-
-        if not result.get("ok"):
-            st.error(result.get("error") or "Mainframe API request failed.")
-            if result.get("status_code") is not None:
-                st.caption(f"HTTP status: {result.get('status_code')}")
-            if result.get("raw_text"):
-                st.code(result.get("raw_text"), language="text")
-            if result.get("response_json") is not None:
-                st.json(result.get("response_json"))
-            return
-
-        response_json = result.get("response_json")
-        table_df = _mainframe_coerce_dataframe(response_json)
-        if table_df is not None and not table_df.empty:
-            st.dataframe(table_df)
-        elif isinstance(response_json, (dict, list)):
-            st.json(response_json)
-        else:
-            raw_text = result.get("raw_text", "")
-            if raw_text:
-                st.code(raw_text, language="text")
-            else:
-                st.info("No response body returned.")
+        _mainframe_render_response(result, operation)
 
 
 
