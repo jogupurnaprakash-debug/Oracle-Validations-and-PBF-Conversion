@@ -248,10 +248,16 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
                     "sql": normalized,
                     "environment": MAINFRAME_ENV,
                 },
-                {"mode": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
-                {"mode": "spufi", "query": normalized, "environment": MAINFRAME_ENV},
-                {"action": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
-                {"operation": "spufi", "sql": normalized, "environment": MAINFRAME_ENV},
+                {
+                    "mode": "submit_and_wait",
+                    "query": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
+                {
+                    "mode": "submit_inline",
+                    "query": normalized,
+                    "environment": MAINFRAME_ENV,
+                },
             ]
         )
     elif operation == "Validate Table":
