@@ -711,6 +711,71 @@ def _mainframe_json_to_readable_table(response_json: Any) -> pd.DataFrame | None
     return None
 
 
+def _mainframe_extract_query_payload(response_json: Any) -> tuple[pd.DataFrame | None, int | None]:
+    payload: Any | None = None
+
+    if isinstance(response_json, dict):
+        payload = response_json
+        structured_content = response_json.get("structuredContent")
+        if isinstance(structured_content, dict):
+            structured_result = structured_content.get("result")
+            if isinstance(structured_result, str) and structured_result.strip():
+                try:
+                    parsed = json.loads(structured_result)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+
+    if not isinstance(payload, dict):
+        return None, None
+
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return None, None
+
+    table_df = pd.DataFrame(rows)
+
+    columns_meta = payload.get("columns")
+    if isinstance(columns_meta, list):
+        ordered_cols: list[str] = []
+        for col_meta in columns_meta:
+            if isinstance(col_meta, dict):
+                col_name = col_meta.get("name")
+                if isinstance(col_name, str) and col_name in table_df.columns and col_name not in ordered_cols:
+                    ordered_cols.append(col_name)
+        if ordered_cols:
+            remaining = [col for col in table_df.columns if col not in ordered_cols]
+            table_df = table_df[ordered_cols + remaining]
+
+    row_count = payload.get("row_count")
+    if not isinstance(row_count, int):
+        row_count = len(table_df)
+
+    return table_df, row_count
+
+
+def _mainframe_markdown_table(table_df: pd.DataFrame) -> str:
+    if table_df.empty:
+        return ""
+
+    def _cell(value: Any) -> str:
+        text = "" if value is None else str(value)
+        text = text.replace("\n", " ").replace("\r", " ")
+        return text.replace("|", "\\|")
+
+    headers = [str(col) for col in table_df.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+
+    for _, row in table_df.iterrows():
+        lines.append("| " + " | ".join(_cell(row[col]) for col in table_df.columns) + " |")
+
+    return "\n".join(lines)
+
+
 def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
     st.divider()
     st.subheader("API response")
@@ -737,6 +802,20 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
     table_df = _mainframe_coerce_dataframe(response_json)
     if table_df is not None and not table_df.empty:
         table_df = _mainframe_apply_preferred_columns(table_df, operation)
+
+    query_df, query_row_count = _mainframe_extract_query_payload(response_json)
+    if query_df is not None and not query_df.empty:
+        query_df = _mainframe_apply_preferred_columns(query_df, operation)
+        st.caption("Here is the data from your JSON formatted into a readable table:")
+        st.markdown(_mainframe_markdown_table(query_df))
+        st.caption(f"(Total rows: {query_row_count if query_row_count is not None else len(query_df)})")
+        download_col1, download_col2 = st.columns(2)
+        with download_col1:
+            _mainframe_render_csv_download(query_df, operation, label="Download Full CSV", key_suffix="full")
+        with download_col2:
+            reference_df = _mainframe_reference_columns_only(query_df, operation)
+            _mainframe_render_csv_download(reference_df, operation, label="Download Filtered CSV", key_suffix="filtered")
+        return
 
     if _mainframe_operation_prefers_table(operation) and table_df is not None and not table_df.empty:
         st.caption(f"Rows returned: {len(table_df)}")
