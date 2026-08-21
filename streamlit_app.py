@@ -170,7 +170,7 @@ def _pbf_init_state() -> None:
 
 
 @st.cache_data(ttl="5m", show_spinner=False)
-def _pbf_resolve_host(hostname: str, port: int) -> dict[str, Any]:
+def _resolve_host(hostname: str, port: int) -> dict[str, Any]:
     try:
         addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
         resolved_hosts = sorted({item[4][0] for item in addresses if item[4]})
@@ -190,8 +190,77 @@ def _pbf_host_looks_internal(hostname: str) -> bool:
     return any(lowered.endswith(suffix) for suffix in PBF_PRIVATE_DOMAIN_SUFFIXES)
 
 
+def _oracle_login_targets() -> list[tuple[str, list[str], list[str], str]]:
+    def unique_non_empty(values: list[str]) -> list[str]:
+        items: list[str] = []
+        for value in values:
+            token = (value or "").strip()
+            if token and token not in items:
+                items.append(token)
+        return items
+
+    return [
+        (
+            "RBM",
+            unique_non_empty([os.getenv("RBM_ORACLE_HOST") or "", os.getenv("ORACLE_HOST") or ""]),
+            unique_non_empty([
+                os.getenv("RBM_ORACLE_PORT") or "",
+                INSTANCE_DEFAULT_PORT,
+                os.getenv("ORACLE_PORT") or "",
+            ]),
+            (os.getenv("RBM_ORACLE_SERVICE") or "r2w1st011").strip(),
+        ),
+        (
+            "UBSR",
+            unique_non_empty([os.getenv("UBSR_ORACLE_HOST") or "", os.getenv("ORACLE_HOST") or ""]),
+            unique_non_empty([
+                os.getenv("UBSR_ORACLE_PORT") or "",
+                INSTANCE_DEFAULT_PORT,
+                os.getenv("ORACLE_PORT") or "",
+            ]),
+            (os.getenv("UBSR_ORACLE_SERVICE") or "ub2wst011").strip(),
+        ),
+    ]
+
+
+def _render_oracle_connectivity_notice() -> bool:
+    checks: list[tuple[str, str, str, dict[str, Any]]] = []
+    any_ok = False
+    for side, hosts, ports, service in _oracle_login_targets():
+        if not hosts:
+            continue
+        for host in hosts:
+            port = ports[0] if ports else INSTANCE_DEFAULT_PORT
+            result = _resolve_host(host, int(port))
+            checks.append((side, host, service, result))
+            if result["ok"]:
+                any_ok = True
+
+    if any_ok:
+        with st.container(border=True):
+            st.caption("Oracle connectivity pre-check")
+            for side, host, service, result in checks:
+                if result["ok"]:
+                    st.caption(f"{side}: {host}/{service} resolved to {', '.join(result['addresses'])}")
+        return True
+
+    with st.container(border=True):
+        st.error("Unable to resolve the configured Oracle host(s) from this deployment environment.")
+        if checks:
+            for side, host, service, result in checks:
+                st.caption(f"{side}: {host}/{service} -> {result['error']}")
+        else:
+            st.caption("No Oracle hosts are configured in the current environment.")
+        st.warning(
+            "These Oracle services appear to be on a private/internal network. Public Streamlit Cloud deployments "
+            "cannot reach them unless DNS and database access are exposed externally."
+        )
+        st.markdown(f"Use the internal deployment instead: {INTERNAL_WORKBENCH_URL}")
+    return False
+
+
 def _render_pbf_connectivity_notice() -> bool:
-    lookup = _pbf_resolve_host(PBF_HOST, PBF_PORT)
+    lookup = _resolve_host(PBF_HOST, PBF_PORT)
     if lookup["ok"]:
         with st.container(border=True):
             st.caption(f"Remote host: {PBF_HOST}:{PBF_PORT}")
@@ -625,36 +694,7 @@ def validate_oracle_login(username: str, password: str) -> tuple[bool, str]:
     if not user or not pw:
         return False, "Username and password are required."
 
-    def unique_non_empty(values: list[str]) -> list[str]:
-        items: list[str] = []
-        for value in values:
-            token = (value or "").strip()
-            if token and token not in items:
-                items.append(token)
-        return items
-
-    targets = [
-        (
-            "RBM",
-            unique_non_empty([os.getenv("RBM_ORACLE_HOST") or "", os.getenv("ORACLE_HOST") or ""]),
-            unique_non_empty([
-                os.getenv("RBM_ORACLE_PORT") or "",
-                INSTANCE_DEFAULT_PORT,
-                os.getenv("ORACLE_PORT") or "",
-            ]),
-            (os.getenv("RBM_ORACLE_SERVICE") or "r2w1st011").strip(),
-        ),
-        (
-            "UBSR",
-            unique_non_empty([os.getenv("UBSR_ORACLE_HOST") or "", os.getenv("ORACLE_HOST") or ""]),
-            unique_non_empty([
-                os.getenv("UBSR_ORACLE_PORT") or "",
-                INSTANCE_DEFAULT_PORT,
-                os.getenv("ORACLE_PORT") or "",
-            ]),
-            (os.getenv("UBSR_ORACLE_SERVICE") or "ub2wst011").strip(),
-        ),
-    ]
+    targets = _oracle_login_targets()
 
     last_error = ""
     for side, hosts, ports, service in targets:
@@ -691,12 +731,18 @@ def ensure_oracle_authenticated() -> None:
         return
 
     st.title("Oracle validation workbench")
+    oracle_hosts_available = _render_oracle_connectivity_notice()
     st.caption("Sign in to continue")
 
     with st.form("app_login", border=True):
         username = st.text_input("Oracle username")
         password = st.text_input("Oracle password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary", icon=":material/login:")
+        submitted = st.form_submit_button(
+            "Sign in",
+            type="primary",
+            icon=":material/login:",
+            disabled=not oracle_hosts_available,
+        )
 
     if submitted:
         if auth_mode() == "app":
