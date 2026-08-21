@@ -673,6 +673,31 @@ def _mainframe_reference_columns_only(table_df: pd.DataFrame, operation: str) ->
     return table_df[available]
 
 
+def _mainframe_json_to_readable_table(response_json: Any) -> pd.DataFrame | None:
+    if isinstance(response_json, list):
+        if not response_json:
+            return pd.DataFrame()
+        if all(isinstance(item, dict) for item in response_json):
+            return pd.json_normalize(response_json)
+        return pd.DataFrame({"value": response_json})
+
+    if isinstance(response_json, dict):
+        if "content" in response_json and isinstance(response_json.get("content"), list):
+            content = response_json.get("content") or []
+            rows: list[dict[str, Any]] = []
+            for item in content:
+                if isinstance(item, dict):
+                    rows.append(item)
+                else:
+                    rows.append({"value": item})
+            if rows:
+                return pd.json_normalize(rows)
+
+        return pd.json_normalize(response_json)
+
+    return None
+
+
 def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
     st.divider()
     st.subheader("API response")
@@ -724,7 +749,16 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
                     reference_df = _mainframe_reference_columns_only(table_df, operation)
                     _mainframe_render_csv_download(reference_df, operation, label="Download Filtered CSV", key_suffix="filtered")
         else:
-            st.json(response_json)
+            normalized_df = _mainframe_json_to_readable_table(response_json)
+            if normalized_df is not None and not normalized_df.empty:
+                st.caption("Readable table view")
+                st.caption(f"Rows returned: {len(normalized_df)}")
+                st.dataframe(normalized_df)
+            else:
+                st.info("No tabular rows detected in response JSON.")
+
+            with st.expander("View raw JSON"):
+                st.json(response_json)
         return
 
     if raw_text:
