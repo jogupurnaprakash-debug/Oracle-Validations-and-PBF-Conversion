@@ -156,6 +156,7 @@ PBF_SCRIPT_TIMEOUT = 300
 MAINFRAME_API_URL = os.getenv("MAINFRAME_API_URL", "http://tpaldrbmva122.ebiz.verizon.com:8051/mcp")
 MAINFRAME_HOST = os.getenv("MAINFRAME_HOST", "tpxvdsi.north.vzwcorp.com")
 MAINFRAME_REGION = os.getenv("MAINFRAME_REGION", "B")
+MAINFRAME_ENV = os.getenv("MAINFRAME_ENV", "tsot1")
 MAINFRAME_PROTOCOL_VERSION = os.getenv("MAINFRAME_PROTOCOL_VERSION", "2024-11-05")
 MAINFRAME_OPERATIONS = [
     "Run SPUFI Query",
@@ -207,6 +208,7 @@ def _mainframe_headers(user_id: str, password: str, session_id: str = "") -> dic
         "X-MF-Password": password,
         "X-MF-Host": MAINFRAME_HOST,
         "X-MF-Region": MAINFRAME_REGION,
+        "X-MF-Environment": MAINFRAME_ENV,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -216,7 +218,7 @@ def _mainframe_headers(user_id: str, password: str, session_id: str = "") -> dic
 
 
 def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
-    return {"operation": operation, "data": data}
+    return {"operation": operation, "data": data, "environment": MAINFRAME_ENV}
 
 
 def _mainframe_jsonrpc_message(method: str, params: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -521,6 +523,7 @@ def render_mainframe_operations_tab() -> None:
 
     st.subheader("Mainframe Operations")
     st.caption("Authenticate with TSO credentials and execute mainframe tasks through the central HTTP API.")
+    st.caption(f"TSO environment: {MAINFRAME_ENV}")
 
     with st.container(border=True):
         st.markdown("**Authentication**")
