@@ -575,10 +575,10 @@ def render_pbf_conversion_tab() -> None:
     st.divider()
 
     with st.form("pbf_conversion_form"):
-        run_mode = st.selectbox(
+        run_mode = st.segmented_control(
             "Conversion mode",
             options=["Single file", "Scheduler (multiple files)"],
-            index=0,
+            default="Single file",
             help="Use scheduler mode to process multiple stream and iteration combinations in one trigger.",
         )
 
@@ -590,6 +590,7 @@ def render_pbf_conversion_tab() -> None:
         col1, col2 = st.columns([2, 1])
         file_name = col1.text_input("File name", placeholder="AF_SADFEE")
         cycle = col2.text_input("Cycle", placeholder="CYC11")
+        scheduler_file_names_raw = ""
 
         stream = ""
         iteration = ""
@@ -601,16 +602,27 @@ def render_pbf_conversion_tab() -> None:
             stream = col3.selectbox("Stream", options=["C", "E", "M"], index=0)
             iteration = col4.selectbox("Iteration", options=[str(i) for i in range(1, 10)], index=0)
         else:
+            scheduler_file_names_raw = st.text_input(
+                "File names (comma-separated)",
+                value=file_name,
+                placeholder="AF_SADFEE, AF_ANOTHER",
+                help="Provide one or more file name prefixes for scheduler mode.",
+            )
+
             col3, col4 = st.columns([1, 2])
             batch_streams = col3.multiselect(
                 "Streams",
                 options=["C", "E", "M"],
                 default=["C", "E", "M"],
+                placeholder="Select one or more streams",
+                help="You can select multiple values.",
             )
             batch_iterations = col4.multiselect(
                 "Iterations",
                 options=[str(i) for i in range(1, 10)],
                 default=["1"],
+                placeholder="Select one or more iterations",
+                help="You can select multiple values.",
             )
 
         col5, col6 = st.columns([3, 1])
@@ -632,15 +644,17 @@ def render_pbf_conversion_tab() -> None:
 
     if run_btn:
         required_fields = [
-            ("File name", file_name),
             ("Cycle", cycle),
             ("Dynamic input path", dynamic_input_path),
         ]
         if run_mode == "Single file":
             required_fields.extend([
+                ("File name", file_name),
                 ("Stream", stream),
                 ("Iteration", iteration),
             ])
+        else:
+            required_fields.append(("File names", scheduler_file_names_raw))
 
         missing = [label for label, value in required_fields if not value.strip()]
         if missing:
@@ -703,21 +717,32 @@ def render_pbf_conversion_tab() -> None:
                             st.session_state.pbf_run_error = f"Unexpected error: {exc}"
                         status_box.update(label="PBF conversion failed", state="error", expanded=True)
             else:
-                jobs = [(s, i) for s in batch_streams for i in batch_iterations]
+                scheduler_file_names = [
+                    token.strip() for token in scheduler_file_names_raw.split(",") if token.strip()
+                ]
+                jobs = [
+                    (f, s, i)
+                    for f in scheduler_file_names
+                    for s in batch_streams
+                    for i in batch_iterations
+                ]
                 batch_results: list[dict[str, str]] = []
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
                     with st.status("Running PBF scheduler...", expanded=True) as status_box:
                         progress = st.progress(0)
                         try:
-                            for idx, (run_stream, run_iteration) in enumerate(jobs, start=1):
+                            for idx, (run_file_name, run_stream, run_iteration) in enumerate(jobs, start=1):
                                 padded_iteration = run_iteration.zfill(2)
-                                st.write(f"[{idx}/{len(jobs)}] Stream={run_stream}, Iteration={padded_iteration}")
+                                st.write(
+                                    f"[{idx}/{len(jobs)}] File={run_file_name}, Stream={run_stream}, "
+                                    f"Iteration={padded_iteration}"
+                                )
                                 try:
                                     matched_dat = _pbf_find_input_dat(
                                         username=st.session_state.get("pbf_username", ""),
                                         password=st.session_state.get("pbf_password", ""),
-                                        file_name=file_name.strip(),
+                                        file_name=run_file_name,
                                         cycle=cycle.strip(),
                                         stream=run_stream,
                                         iteration=padded_iteration,
@@ -726,7 +751,7 @@ def render_pbf_conversion_tab() -> None:
                                     file_bytes, csv_name, remote_csv_path = _pbf_run_conversion(
                                         username=st.session_state.get("pbf_username", ""),
                                         password=st.session_state.get("pbf_password", ""),
-                                        file_name=file_name.strip(),
+                                        file_name=run_file_name,
                                         cycle=cycle.strip(),
                                         stream=run_stream,
                                         iteration=padded_iteration,
@@ -735,9 +760,11 @@ def render_pbf_conversion_tab() -> None:
                                         download_output=True,
                                     )
                                     if file_bytes is not None:
-                                        zip_file.writestr(csv_name, file_bytes)
+                                        zip_entry_name = f"{run_file_name}_{cycle.strip()}{run_stream}{padded_iteration}_{csv_name}"
+                                        zip_file.writestr(zip_entry_name, file_bytes)
                                     batch_results.append(
                                         {
+                                            "file_name": run_file_name,
                                             "stream": run_stream,
                                             "iteration": padded_iteration,
                                             "status": "Success",
@@ -749,6 +776,7 @@ def render_pbf_conversion_tab() -> None:
                                 except Exception as combo_exc:
                                     batch_results.append(
                                         {
+                                            "file_name": run_file_name,
                                             "stream": run_stream,
                                             "iteration": padded_iteration,
                                             "status": "Failed",
