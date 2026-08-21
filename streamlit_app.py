@@ -250,6 +250,27 @@ def _extract_jsonrpc_error_code(body: Any) -> int | None:
     return None
 
 
+def _extract_mcp_result_error_message(result_body: Any) -> str:
+    if not isinstance(result_body, dict):
+        return ""
+
+    content = result_body.get("content")
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    text_parts.append(text_value.strip())
+        if text_parts:
+            return "\n".join(text_parts)
+
+    fallback = result_body.get("message")
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    return ""
+
+
 def _mainframe_post_jsonrpc(
     user_id: str,
     password: str,
@@ -274,6 +295,11 @@ def _mainframe_coerce_dataframe(response_json: Any) -> pd.DataFrame | None:
         return pd.DataFrame(response_json)
 
     if isinstance(response_json, dict):
+        # MCP tool responses may include {'isError': bool, 'content': [...]}.
+        # Avoid rendering these control envelopes as one-row dataframes.
+        if "isError" in response_json and "content" in response_json:
+            return None
+
         for key in ("rows", "data", "result", "results"):
             value = response_json.get(key)
             if isinstance(value, list):
@@ -321,6 +347,13 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
 
     response_json = result.get("response_json")
     raw_text = (result.get("raw_text") or "").strip()
+
+    if isinstance(response_json, dict) and response_json.get("isError") is True:
+        mcp_error_text = _extract_mcp_result_error_message(response_json) or "Mainframe operation returned isError=true."
+        st.error(mcp_error_text)
+        st.json(response_json)
+        return
+
     table_df = _mainframe_coerce_dataframe(response_json)
 
     if _mainframe_operation_prefers_table(operation) and table_df is not None and not table_df.empty:
@@ -434,6 +467,25 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str, s
 
         # JSON-RPC success typically returns result.
         success_body = response_json.get("result") if isinstance(response_json, dict) else response_json
+
+        if isinstance(success_body, dict) and success_body.get("isError") is True:
+            mcp_error_text = _extract_mcp_result_error_message(success_body) or "Mainframe operation returned isError=true."
+            last_error_text = mcp_error_text
+            retryable = (
+                "invalid params" in mcp_error_text.lower()
+                or "invalid request parameters" in mcp_error_text.lower()
+                or "method not found" in mcp_error_text.lower()
+            )
+            if retryable:
+                continue
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "response_json": success_body,
+                "raw_text": raw_text,
+                "error": mcp_error_text,
+            }
+
         return {
             "ok": True,
             "status_code": response.status_code,
