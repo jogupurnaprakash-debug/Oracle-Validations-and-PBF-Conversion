@@ -164,7 +164,10 @@ MAINFRAME_OPERATIONS = [
     "Validate Table",
     "Submit JCL",
     "View Dataset",
+    "Analyze Customer & MTN Tables",
 ]
+MAINFRAME_ANALYSIS_TABLES = ["PPLAN_MTN", "SF_MTN", "LN_SVC_PROD"]
+MAINFRAME_DB2_SCHEMA = os.getenv("MAINFRAME_DB2_SCHEMA", "").strip()
 MAINFRAME_SPUFI_COLUMNS = [
     "BL_CYC_NO",
     "MDN",
@@ -234,6 +237,18 @@ def _mainframe_headers(user_id: str, password: str, session_id: str = "") -> dic
 
 def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
     return {"operation": operation, "data": data, "environment": MAINFRAME_ENV}
+
+
+def _mainframe_qualify_table_name(table_name: str) -> str:
+    if "." in table_name:
+        return table_name
+    if MAINFRAME_DB2_SCHEMA:
+        return f"{MAINFRAME_DB2_SCHEMA}.{table_name}"
+    return table_name
+
+
+def _mainframe_sql_escape(value: str) -> str:
+    return value.replace("'", "''")
 
 
 def _mainframe_copybook_map() -> dict[str, str]:
@@ -492,6 +507,187 @@ def _mainframe_operation_argument_variants(
         seen.add(item_key)
         deduped.append(item)
     return deduped
+
+
+def _mainframe_result_to_dataframe(result: dict[str, Any]) -> pd.DataFrame | None:
+    response_json = result.get("response_json")
+
+    table_df, _ = _mainframe_extract_query_payload(response_json)
+    if table_df is not None and not table_df.empty:
+        return table_df
+
+    table_df = _mainframe_coerce_dataframe(response_json)
+    if table_df is not None and not table_df.empty:
+        return table_df
+
+    table_df = _mainframe_json_to_readable_table(response_json)
+    if table_df is not None and not table_df.empty:
+        return table_df
+
+    return None
+
+
+def _mainframe_filter_analysis_by_mtn(table_df: pd.DataFrame, mtn: str) -> pd.DataFrame:
+    if table_df.empty:
+        return table_df
+
+    target = re.sub(r"\D", "", mtn)
+    if not target:
+        return table_df
+
+    candidate_columns = [col for col in ["MTN", "MDN", "MOBILE_NO", "PHONE_NO", "TEL_NO"] if col in table_df.columns]
+
+    working_df = table_df.copy()
+    if {"NPA", "NXX", "TLN"}.issubset(set(working_df.columns)):
+        working_df["_MF_DERIVED_MTN"] = (
+            working_df["NPA"].astype(str).str.strip()
+            + working_df["NXX"].astype(str).str.strip()
+            + working_df["TLN"].astype(str).str.strip()
+        )
+        candidate_columns.append("_MF_DERIVED_MTN")
+
+    if not candidate_columns:
+        return working_df.drop(columns=["_MF_DERIVED_MTN"], errors="ignore")
+
+    mask = pd.Series(False, index=working_df.index)
+    for col in candidate_columns:
+        normalized_col = working_df[col].astype(str).str.replace(r"\D", "", regex=True)
+        mask = mask | (normalized_col == target)
+
+    filtered = working_df[mask]
+    return filtered.drop(columns=["_MF_DERIVED_MTN"], errors="ignore")
+
+
+def _mainframe_tiering_summary(analysis_tables: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    plan_df = analysis_tables.get("PPLAN_MTN", pd.DataFrame())
+    feature_df = analysis_tables.get("SF_MTN", pd.DataFrame())
+    product_df = analysis_tables.get("LN_SVC_PROD", pd.DataFrame())
+
+    plans = len(plan_df)
+    features = len(feature_df)
+    products = len(product_df)
+    total = plans + features + products
+
+    if total >= 10:
+        tier = "Enterprise"
+    elif total >= 6:
+        tier = "Premium"
+    elif total >= 3:
+        tier = "Standard"
+    else:
+        tier = "Basic"
+
+    return {
+        "plans": plans,
+        "features": features,
+        "products": products,
+        "total_items": total,
+        "tier": tier,
+        "notes": "Tier inferred from active plan/feature/product footprint across mainframe tables.",
+    }
+
+
+def _mainframe_run_customer_mtn_analysis(
+    customer_id: str,
+    mtn: str,
+    user_id: str,
+    password: str,
+    session_id: str,
+    tool_name: str,
+    available_tools: list[str],
+) -> dict[str, Any]:
+    customer_token = customer_id.strip()
+    mtn_token = mtn.strip()
+    if not customer_token or not mtn_token:
+        return {
+            "result_type": "customer_mtn_analysis",
+            "ok": False,
+            "error": "Customer ID and MTN are required for analysis.",
+            "tables": {},
+            "table_results": {},
+            "summary": {},
+        }
+
+    query_results: dict[str, dict[str, Any]] = {}
+    table_data: dict[str, pd.DataFrame] = {}
+    escaped_customer = _mainframe_sql_escape(customer_token)
+
+    for table_name in MAINFRAME_ANALYSIS_TABLES:
+        qualified = _mainframe_qualify_table_name(table_name)
+        sql = (
+            f"SELECT * FROM {qualified} "
+            f"WHERE CUST_ID_NO = '{escaped_customer}' "
+            "WITH UR"
+        )
+
+        result = _mainframe_execute(
+            "Run SPUFI Query",
+            sql,
+            user_id,
+            password,
+            session_id,
+            tool_name,
+            available_tools,
+        )
+        query_results[table_name] = result
+
+        if result.get("ok"):
+            table_df = _mainframe_result_to_dataframe(result)
+            if table_df is not None and not table_df.empty:
+                table_data[table_name] = _mainframe_filter_analysis_by_mtn(table_df, mtn_token)
+            else:
+                table_data[table_name] = pd.DataFrame()
+        else:
+            table_data[table_name] = pd.DataFrame()
+
+    all_ok = all(item.get("ok") for item in query_results.values())
+    summary = _mainframe_tiering_summary(table_data)
+
+    return {
+        "result_type": "customer_mtn_analysis",
+        "ok": all_ok,
+        "error": "" if all_ok else "One or more analysis queries failed.",
+        "customer_id": customer_token,
+        "mtn": mtn_token,
+        "tables": table_data,
+        "table_results": query_results,
+        "summary": summary,
+    }
+
+
+def _mainframe_render_customer_mtn_analysis(result: dict[str, Any]) -> None:
+    st.divider()
+    st.subheader("Customer & MTN Analysis")
+
+    if not result.get("ok"):
+        st.error(result.get("error") or "Customer/MTN analysis failed.")
+
+    summary = result.get("summary", {})
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("Plans", int(summary.get("plans", 0)))
+    metric_col2.metric("Features", int(summary.get("features", 0)))
+    metric_col3.metric("Products", int(summary.get("products", 0)))
+    metric_col4.metric("Tier", str(summary.get("tier", "Unknown")))
+    st.caption(str(summary.get("notes", "")))
+
+    table_data = result.get("tables", {})
+    table_results = result.get("table_results", {})
+
+    for table_name in MAINFRAME_ANALYSIS_TABLES:
+        st.markdown(f"**{table_name}**")
+        table_df = table_data.get(table_name)
+        if isinstance(table_df, pd.DataFrame) and not table_df.empty:
+            st.caption(f"Rows returned: {len(table_df)}")
+            st.dataframe(table_df)
+        else:
+            table_result = table_results.get(table_name, {})
+            if table_result and not table_result.get("ok"):
+                st.warning(table_result.get("error") or f"No data for {table_name}.")
+                if table_result.get("raw_text"):
+                    with st.expander(f"{table_name} raw response"):
+                        st.code(table_result.get("raw_text"), language="text")
+            else:
+                st.info("No matching rows for the provided Customer ID and MTN.")
 
 
 def _mainframe_jsonrpc_message(method: str, params: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -1358,6 +1554,7 @@ def render_mainframe_operations_tab() -> None:
         "Validate Table": "Validate",
         "Submit JCL": "Submit",
         "View Dataset": "View",
+        "Analyze Customer & MTN Tables": "Execute Analysis",
     }
 
     with st.form("mainframe_operations_form"):
@@ -1425,6 +1622,22 @@ def render_mainframe_operations_tab() -> None:
                 disabled=ops_disabled,
             )
             st.caption("Tip: Set MAINFRAME_COPYBOOK_MAP in env as JSON, e.g. {\"ALL\":\"SVCPRD_COPYBOOK\"} for auto file-to-copybook mapping.")
+        elif operation == "Analyze Customer & MTN Tables":
+            analysis_col1, analysis_col2 = st.columns(2)
+            customer_id = analysis_col1.text_input(
+                "Customer ID",
+                key="mf_analysis_customer_id",
+                placeholder="e.g. 201104288",
+                disabled=ops_disabled,
+            )
+            mtn = analysis_col2.text_input(
+                "MTN",
+                key="mf_analysis_mtn",
+                placeholder="e.g. 8042967625",
+                disabled=ops_disabled,
+            )
+            data_value = json.dumps({"customer_id": customer_id.strip(), "mtn": mtn.strip()})
+            st.caption("Runs analysis across PPLAN_MTN, SF_MTN, and LN_SVC_PROD using existing mainframe query execution.")
 
         action_label = operation_to_button.get(operation, "Execute")
         submit_clicked = st.form_submit_button(
@@ -1450,26 +1663,51 @@ def render_mainframe_operations_tab() -> None:
         if not data_value.strip():
             missing.append("Operation input")
 
+        if operation == "Analyze Customer & MTN Tables":
+            try:
+                parsed_input = json.loads(data_value or "{}")
+            except Exception:
+                parsed_input = {}
+            if not str(parsed_input.get("customer_id", "")).strip():
+                missing.append("Customer ID")
+            if not str(parsed_input.get("mtn", "")).strip():
+                missing.append("MTN")
+
         if missing:
             st.error(f"Please fill in: {', '.join(missing)}")
         else:
             with st.spinner(f"{action_label} in progress..."):
-                result = _mainframe_execute(
-                    operation,
-                    data_value.strip(),
-                    tso_user_id.strip(),
-                    tso_password,
-                    st.session_state.get("mf_session_id", ""),
-                    st.session_state.get("mf_tool_name", ""),
-                    st.session_state.get("mf_available_tools", []),
-                    st.session_state.get("mf_dataset_copybook", ""),
-                    st.session_state.get("mf_dataset_volser", ""),
-                )
+                if operation == "Analyze Customer & MTN Tables":
+                    parsed_input = json.loads(data_value or "{}")
+                    result = _mainframe_run_customer_mtn_analysis(
+                        str(parsed_input.get("customer_id", "")).strip(),
+                        str(parsed_input.get("mtn", "")).strip(),
+                        tso_user_id.strip(),
+                        tso_password,
+                        st.session_state.get("mf_session_id", ""),
+                        st.session_state.get("mf_tool_name", ""),
+                        st.session_state.get("mf_available_tools", []),
+                    )
+                else:
+                    result = _mainframe_execute(
+                        operation,
+                        data_value.strip(),
+                        tso_user_id.strip(),
+                        tso_password,
+                        st.session_state.get("mf_session_id", ""),
+                        st.session_state.get("mf_tool_name", ""),
+                        st.session_state.get("mf_available_tools", []),
+                        st.session_state.get("mf_dataset_copybook", ""),
+                        st.session_state.get("mf_dataset_volser", ""),
+                    )
                 st.session_state.mf_last_result = result
 
     result = st.session_state.get("mf_last_result")
     if result:
-        _mainframe_render_response(result, operation)
+        if isinstance(result, dict) and result.get("result_type") == "customer_mtn_analysis":
+            _mainframe_render_customer_mtn_analysis(result)
+        else:
+            _mainframe_render_response(result, operation)
 
 
 
