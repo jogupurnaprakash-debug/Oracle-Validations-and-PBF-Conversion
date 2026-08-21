@@ -800,7 +800,7 @@ def _mainframe_execute(
                     or "parameter" in lower_error
                     or "unknown mode" in lower_error
                 )
-                if method == "tools/call" and attempted_tool_name and retryable_embedded:
+                if retryable_embedded:
                     continue
                 return {
                     "ok": False,
