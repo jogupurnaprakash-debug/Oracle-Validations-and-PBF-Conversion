@@ -307,6 +307,45 @@ def _mainframe_extract_tool_names(body: Any) -> list[str]:
     return deduped
 
 
+def _mainframe_score_tool_name(tool_name: str) -> int:
+    lowered = tool_name.lower()
+    score = 0
+
+    # Positive signals for operation-style tools.
+    for token in ("mainframe", "operation", "execute", "run", "spufi", "query", "dataset", "jcl", "validate"):
+        if token in lowered:
+            score += 2
+
+    # Negative signals for analysis/file-only tools.
+    for token in ("analyze", "analysis", "file", "path", "item", "lint", "review"):
+        if token in lowered:
+            score -= 3
+
+    return score
+
+
+def _mainframe_rank_tool_candidates(discovered_names: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for name in discovered_names:
+        normalized = (name or "").strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(normalized)
+
+    # Keep only likely operation tools when we have any strong candidates.
+    scored = [(name, _mainframe_score_tool_name(name)) for name in cleaned]
+    strong = [name for name, score in scored if score > 0]
+    candidates = strong if strong else cleaned
+
+    candidates.sort(key=lambda name: _mainframe_score_tool_name(name), reverse=True)
+    return candidates
+
+
 def _mainframe_tool_aliases() -> list[str]:
     configured = os.getenv("MAINFRAME_TOOL_NAME", "").strip()
     aliases = [
@@ -336,19 +375,21 @@ def _resolve_mainframe_tool_name(discovered_names: list[str]) -> str:
     if not discovered_names:
         return ""
 
+    ranked = _mainframe_rank_tool_candidates(discovered_names)
+
     preferred_aliases = [name.lower() for name in _mainframe_tool_aliases()]
     for alias in preferred_aliases:
-        for discovered in discovered_names:
+        for discovered in ranked:
             if discovered.lower() == alias:
                 return discovered
 
     # Fall back to a likely operation tool if aliases did not match exactly.
-    for discovered in discovered_names:
+    for discovered in ranked:
         lowered = discovered.lower()
-        if "mainframe" in lowered or "tso" in lowered or "operation" in lowered:
+        if "mainframe" in lowered or "tso" in lowered or "operation" in lowered or "execute" in lowered:
             return discovered
 
-    return discovered_names[0]
+    return ranked[0]
 
 
 def _mainframe_post_jsonrpc(
@@ -462,6 +503,7 @@ def _mainframe_execute(
     password: str,
     session_id: str,
     tool_name: str = "",
+    available_tools: list[str] | None = None,
 ) -> dict[str, Any]:
     if not session_id.strip():
         return {
@@ -479,8 +521,10 @@ def _mainframe_execute(
         ("run_operation", payload, "mf-op-3", ""),
     ]
 
+    ranked_discovered = _mainframe_rank_tool_candidates(available_tools or [])
+
     tool_candidates: list[str] = []
-    for candidate in [tool_name.strip(), *_mainframe_tool_aliases()]:
+    for candidate in [tool_name.strip(), *ranked_discovered, *_mainframe_tool_aliases()]:
         if candidate and candidate.lower() not in {item.lower() for item in tool_candidates}:
             tool_candidates.append(candidate)
 
@@ -569,14 +613,22 @@ def _mainframe_execute(
         if isinstance(success_body, dict) and success_body.get("isError") is True:
             mcp_error_text = _extract_mcp_result_error_message(success_body) or "Mainframe operation returned isError=true."
             last_error_text = mcp_error_text
+            lower_error = mcp_error_text.lower()
             unknown_tool = "unknown tool" in mcp_error_text.lower()
-            retryable = (
-                "invalid params" in mcp_error_text.lower()
-                or "invalid request parameters" in mcp_error_text.lower()
-                or "method not found" in mcp_error_text.lower()
-                or unknown_tool
+            validation_mismatch = (
+                "validation error" in lower_error
+                or "field required" in lower_error
+                or "input should be" in lower_error
+                or "arguments" in lower_error
             )
-            if unknown_tool and method == "tools/call" and attempted_tool_name:
+            retryable = (
+                "invalid params" in lower_error
+                or "invalid request parameters" in lower_error
+                or "method not found" in lower_error
+                or unknown_tool
+                or validation_mismatch
+            )
+            if (unknown_tool or validation_mismatch) and method == "tools/call" and attempted_tool_name:
                 continue
             if retryable:
                 continue
@@ -846,6 +898,7 @@ def render_mainframe_operations_tab() -> None:
                     tso_password,
                     st.session_state.get("mf_session_id", ""),
                     st.session_state.get("mf_tool_name", ""),
+                    st.session_state.get("mf_available_tools", []),
                 )
                 st.session_state.mf_last_result = result
 
