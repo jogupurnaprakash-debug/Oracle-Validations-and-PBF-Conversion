@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import socket
@@ -223,6 +224,59 @@ def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
     return {"operation": operation, "data": data, "environment": MAINFRAME_ENV}
 
 
+def _mainframe_operation_argument_variants(operation: str, data: str) -> list[dict[str, Any]]:
+    normalized = data.strip()
+    if not normalized:
+        return [_mainframe_payload(operation, data)]
+
+    variants: list[dict[str, Any]] = [_mainframe_payload(operation, normalized)]
+
+    if operation == "Run SPUFI Query":
+        variants.extend(
+            [
+                {"mode": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
+                {"mode": "spufi", "query": normalized, "environment": MAINFRAME_ENV},
+                {"action": "run_spufi", "sql": normalized, "environment": MAINFRAME_ENV},
+                {"operation": "spufi", "sql": normalized, "environment": MAINFRAME_ENV},
+            ]
+        )
+    elif operation == "Validate Table":
+        variants.extend(
+            [
+                {"mode": "validate_table", "table": normalized, "environment": MAINFRAME_ENV},
+                {"mode": "validate", "table_name": normalized, "environment": MAINFRAME_ENV},
+                {"operation": "validate_table", "table": normalized, "environment": MAINFRAME_ENV},
+            ]
+        )
+    elif operation == "Submit JCL":
+        variants.extend(
+            [
+                {"mode": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
+                {"action": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
+                {"operation": "submit_jcl", "jcl": normalized, "environment": MAINFRAME_ENV},
+            ]
+        )
+    elif operation == "View Dataset":
+        variants.extend(
+            [
+                {"mode": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
+                {"mode": "submit_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
+                {"action": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
+                {"operation": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
+            ]
+        )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in variants:
+        item_key = json.dumps(item, sort_keys=True)
+        if item_key in seen:
+            continue
+        seen.add(item_key)
+        deduped.append(item)
+    return deduped
+
+
 def _mainframe_jsonrpc_message(method: str, params: dict[str, Any], request_id: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -270,6 +324,38 @@ def _extract_mcp_result_error_message(result_body: Any) -> str:
     fallback = result_body.get("message")
     if isinstance(fallback, str) and fallback.strip():
         return fallback.strip()
+    return ""
+
+
+def _extract_mcp_embedded_error_message(result_body: Any) -> str:
+    if not isinstance(result_body, dict):
+        return ""
+
+    structured_content = result_body.get("structuredContent")
+    if isinstance(structured_content, dict):
+        direct_error = structured_content.get("error")
+        if isinstance(direct_error, str) and direct_error.strip():
+            return direct_error.strip()
+
+        nested_result = structured_content.get("result")
+        if isinstance(nested_result, str) and nested_result.strip():
+            text = nested_result.strip()
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                parsed_error = parsed.get("error")
+                if isinstance(parsed_error, str) and parsed_error.strip():
+                    return parsed_error.strip()
+            if '"error"' in text or "'error'" in text:
+                return text
+
+    content_error = _extract_mcp_result_error_message(result_body)
+    lower_content_error = content_error.lower()
+    if "error" in lower_content_error and ("required" in lower_content_error or "missing" in lower_content_error):
+        return content_error
+
     return ""
 
 
@@ -515,6 +601,7 @@ def _mainframe_execute(
         }
 
     payload = _mainframe_payload(operation, data)
+    argument_variants = _mainframe_operation_argument_variants(operation, data)
     attempts: list[tuple[str, dict[str, Any], str, str]] = [
         ("mainframe.execute", payload, "mf-op-1", ""),
         ("execute", payload, "mf-op-2", ""),
@@ -528,18 +615,23 @@ def _mainframe_execute(
         if candidate and candidate.lower() not in {item.lower() for item in tool_candidates}:
             tool_candidates.append(candidate)
 
-    for index, candidate in enumerate(tool_candidates, start=1):
-        attempts.append(
-            (
-                "tools/call",
-                {
-                    "name": candidate,
-                    "arguments": payload,
-                },
-                f"mf-op-tool-{index}",
-                candidate,
+    tool_attempt_id = 0
+    for candidate in tool_candidates:
+        for argument_variant in argument_variants:
+            tool_attempt_id += 1
+            attempts.append(
+                (
+                    "tools/call",
+                    {
+                        "name": candidate,
+                        "arguments": argument_variant,
+                    },
+                    f"mf-op-tool-{tool_attempt_id}",
+                    candidate,
+                )
             )
-        )
+
+
 
     last_response: requests.Response | None = None
     last_json: Any | None = None
@@ -640,6 +732,27 @@ def _mainframe_execute(
                 "error": mcp_error_text,
             }
 
+        if isinstance(success_body, dict):
+            embedded_error_text = _extract_mcp_embedded_error_message(success_body)
+            if embedded_error_text:
+                last_error_text = embedded_error_text
+                lower_error = embedded_error_text.lower()
+                retryable_embedded = (
+                    "required" in lower_error
+                    or "missing" in lower_error
+                    or "invalid" in lower_error
+                    or "parameter" in lower_error
+                )
+                if method == "tools/call" and attempted_tool_name and retryable_embedded:
+                    continue
+                return {
+                    "ok": False,
+                    "status_code": response.status_code,
+                    "response_json": success_body,
+                    "raw_text": raw_text,
+                    "error": embedded_error_text,
+                }
+
         return {
             "ok": True,
             "status_code": response.status_code,
@@ -673,6 +786,8 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str, str
             },
             request_id="mf-init",
             timeout=30,
+
+
         )
     except requests.exceptions.RequestException as exc:
         return False, f"Connection failed: {exc}", "", "", []
