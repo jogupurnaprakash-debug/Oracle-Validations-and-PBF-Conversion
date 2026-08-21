@@ -682,6 +682,19 @@ def _mainframe_json_to_readable_table(response_json: Any) -> pd.DataFrame | None
         return pd.DataFrame({"value": response_json})
 
     if isinstance(response_json, dict):
+        structured_content = response_json.get("structuredContent")
+        if isinstance(structured_content, dict):
+            structured_result = structured_content.get("result")
+            if isinstance(structured_result, str) and structured_result.strip():
+                try:
+                    parsed_result = json.loads(structured_result)
+                except Exception:
+                    parsed_result = None
+                if parsed_result is not None:
+                    parsed_df = _mainframe_json_to_readable_table(parsed_result)
+                    if parsed_df is not None:
+                        return parsed_df
+
         if "content" in response_json and isinstance(response_json.get("content"), list):
             content = response_json.get("content") or []
             rows: list[dict[str, Any]] = []
@@ -751,9 +764,16 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
         else:
             normalized_df = _mainframe_json_to_readable_table(response_json)
             if normalized_df is not None and not normalized_df.empty:
+                normalized_df = _mainframe_apply_preferred_columns(normalized_df, operation)
                 st.caption("Readable table view")
                 st.caption(f"Rows returned: {len(normalized_df)}")
                 st.dataframe(normalized_df)
+                download_col1, download_col2 = st.columns(2)
+                with download_col1:
+                    _mainframe_render_csv_download(normalized_df, operation, label="Download Full CSV", key_suffix="full")
+                with download_col2:
+                    reference_df = _mainframe_reference_columns_only(normalized_df, operation)
+                    _mainframe_render_csv_download(reference_df, operation, label="Download Filtered CSV", key_suffix="filtered")
             else:
                 st.info("No tabular rows detected in response JSON.")
 
