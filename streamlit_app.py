@@ -619,16 +619,21 @@ def _mainframe_csv_filename(operation: str) -> str:
     return f"{safe}_{stamp}.csv"
 
 
-def _mainframe_render_csv_download(table_df: pd.DataFrame, operation: str) -> None:
+def _mainframe_render_csv_download(
+    table_df: pd.DataFrame,
+    operation: str,
+    label: str = "Download CSV",
+    key_suffix: str = "full",
+) -> None:
     if table_df.empty:
         return
     csv_bytes = table_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download CSV",
+        label,
         data=csv_bytes,
         file_name=_mainframe_csv_filename(operation),
         mime="text/csv",
-        key=f"mf_csv_download_{operation}",
+        key=f"mf_csv_download_{operation}_{key_suffix}",
     )
 
 
@@ -656,6 +661,16 @@ def _mainframe_apply_preferred_columns(table_df: pd.DataFrame, operation: str) -
         selected[str(extra)] = table_df[extra]
 
     return pd.DataFrame(selected)
+
+
+def _mainframe_reference_columns_only(table_df: pd.DataFrame, operation: str) -> pd.DataFrame:
+    if table_df.empty or operation != "Run SPUFI Query":
+        return table_df
+
+    available = [col for col in MAINFRAME_SPUFI_COLUMNS if col in table_df.columns]
+    if not available:
+        return table_df
+    return table_df[available]
 
 
 def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
@@ -688,7 +703,12 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
     if _mainframe_operation_prefers_table(operation) and table_df is not None and not table_df.empty:
         st.caption(f"Rows returned: {len(table_df)}")
         st.dataframe(table_df)
-        _mainframe_render_csv_download(table_df, operation)
+        download_col1, download_col2 = st.columns(2)
+        with download_col1:
+            _mainframe_render_csv_download(table_df, operation, label="Download Full CSV", key_suffix="full")
+        with download_col2:
+            reference_df = _mainframe_reference_columns_only(table_df, operation)
+            _mainframe_render_csv_download(reference_df, operation, label="Download Filtered CSV", key_suffix="filtered")
         return
 
     if isinstance(response_json, (dict, list)):
@@ -697,7 +717,12 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
                 st.caption("Structured response")
                 st.caption(f"Rows returned: {len(table_df)}")
                 st.dataframe(table_df)
-                _mainframe_render_csv_download(table_df, operation)
+                download_col1, download_col2 = st.columns(2)
+                with download_col1:
+                    _mainframe_render_csv_download(table_df, operation, label="Download Full CSV", key_suffix="full")
+                with download_col2:
+                    reference_df = _mainframe_reference_columns_only(table_df, operation)
+                    _mainframe_render_csv_download(reference_df, operation, label="Download Filtered CSV", key_suffix="filtered")
         else:
             st.json(response_json)
         return
