@@ -349,8 +349,8 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str]:
     if response.status_code == 401:
         return False, "Unauthorized: invalid TSO credentials."
 
-    # Some backends may reject PING as an unsupported operation but still confirm auth/session.
-    if response.status_code in {400, 404, 405}:
+    # Some backends may reject PING as unsupported/not acceptable but still confirm auth/session.
+    if response.status_code in {400, 404, 405, 406}:
         return True, "Connected to TSO gateway."
 
     if response.ok:
