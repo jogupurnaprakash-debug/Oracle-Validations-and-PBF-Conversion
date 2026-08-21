@@ -7,6 +7,7 @@ import socket
 import signal
 import subprocess
 import time
+import zipfile
 from hmac import compare_digest
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +164,8 @@ def _pbf_init_state() -> None:
         "pbf_run_error": "",
         "pbf_username": "",
         "pbf_password": "",
+        "pbf_batch_results": [],
+        "pbf_batch_zip_bytes": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -374,7 +377,8 @@ def _pbf_run_conversion(
     iteration: str,
     dynamic_input_path: str,
     matched_dat: str,
-) -> tuple[bytes, str, str]:
+    download_output: bool = True,
+) -> tuple[bytes | None, str, str]:
     client = _pbf_make_ssh_client(username, password)
     sftp = None
     try:
@@ -490,6 +494,10 @@ def _pbf_run_conversion(
 
         csv_name = csv_files[0].filename
         remote_csv_path = f"{output_folder_path}/{csv_name}"
+
+        if not download_output:
+            return None, csv_name, remote_csv_path
+
         buf = io.BytesIO()
         sftp.getfo(remote_csv_path, buf)
 
@@ -567,25 +575,53 @@ def render_pbf_conversion_tab() -> None:
     st.divider()
 
     with st.form("pbf_conversion_form"):
+        run_mode = st.selectbox(
+            "Conversion mode",
+            options=["Single file", "Scheduler (multiple files)"],
+            index=0,
+            help="Use scheduler mode to process multiple stream and iteration combinations in one trigger.",
+        )
+
         st.caption(
             "Filename format: {FILE_NAME}_{TAG}_{CYCLE}{STREAM}{ITERATION}_{TIMESTAMP}_V2_VB2B "
             "(for example AF_SADFEE_HJK_CYC11C01_202608200638_V2_VB2B)."
         )
 
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2 = st.columns([2, 1])
         file_name = col1.text_input("File name", placeholder="AF_SADFEE")
         cycle = col2.text_input("Cycle", placeholder="CYC11")
-        stream = col3.text_input("Stream", placeholder="C")
 
-        col4, col5 = st.columns([1, 3])
-        iteration = col4.text_input("Iteration", placeholder="01")
+        stream = ""
+        iteration = ""
+        batch_streams: list[str] = []
+        batch_iterations: list[str] = []
+
+        if run_mode == "Single file":
+            col3, col4 = st.columns([1, 1])
+            stream = col3.selectbox("Stream", options=["C", "E", "M"], index=0)
+            iteration = col4.selectbox("Iteration", options=[str(i) for i in range(1, 10)], index=0)
+        else:
+            col3, col4 = st.columns([1, 2])
+            batch_streams = col3.multiselect(
+                "Streams",
+                options=["C", "E", "M"],
+                default=["C", "E", "M"],
+            )
+            batch_iterations = col4.multiselect(
+                "Iterations",
+                options=[str(i) for i in range(1, 10)],
+                default=["1"],
+            )
+
+        col5, col6 = st.columns([3, 1])
         dynamic_input_path = col5.text_input(
             "Dynamic input path",
             placeholder="/data/usagebrkr/st1/input/vision/Prod_EOC_Backup/20260811/PBF1",
         )
 
-        run_btn = st.form_submit_button(
-            "Run conversion",
+        run_btn_label = "Run conversion" if run_mode == "Single file" else "Trigger scheduler"
+        run_btn = col6.form_submit_button(
+            run_btn_label,
             type="primary",
             icon=":material/play_arrow:",
             disabled=not st.session_state.get("pbf_connected") or not host_available,
@@ -595,69 +631,149 @@ def render_pbf_conversion_tab() -> None:
         st.warning("Connect with Unix credentials before running conversion.")
 
     if run_btn:
-        missing = [
-            label
-            for label, value in [
-                ("File name", file_name),
-                ("Cycle", cycle),
+        required_fields = [
+            ("File name", file_name),
+            ("Cycle", cycle),
+            ("Dynamic input path", dynamic_input_path),
+        ]
+        if run_mode == "Single file":
+            required_fields.extend([
                 ("Stream", stream),
                 ("Iteration", iteration),
-                ("Dynamic input path", dynamic_input_path),
-            ]
-            if not value.strip()
-        ]
+            ])
+
+        missing = [label for label, value in required_fields if not value.strip()]
         if missing:
             st.error(f"Please fill in: {', '.join(missing)}")
+        elif run_mode == "Scheduler (multiple files)" and not batch_streams:
+            st.error("Select at least one stream for scheduler mode.")
+        elif run_mode == "Scheduler (multiple files)" and not batch_iterations:
+            st.error("Select at least one iteration for scheduler mode.")
         else:
             st.session_state.pbf_download_bytes = None
             st.session_state.pbf_download_name = ""
             st.session_state.pbf_download_remote_path = ""
             st.session_state.pbf_run_error = ""
+            st.session_state.pbf_batch_results = []
+            st.session_state.pbf_batch_zip_bytes = None
 
-            with st.status("Running PBF conversion...", expanded=True) as status_box:
-                try:
-                    st.write(
-                        f"Checking {dynamic_input_path} for .DAT file matching "
-                        f"{file_name}*{cycle}{stream}{iteration}*.DAT"
-                    )
-                    matched_dat = _pbf_find_input_dat(
-                        username=st.session_state.get("pbf_username", ""),
-                        password=st.session_state.get("pbf_password", ""),
-                        file_name=file_name.strip(),
-                        cycle=cycle.strip(),
-                        stream=stream.strip(),
-                        iteration=iteration.strip(),
-                        dynamic_input_path=dynamic_input_path.strip(),
-                    )
-                    st.write(f"Input file found: {matched_dat}")
-                    st.write("Running remote conversion script...")
+            if run_mode == "Single file":
+                with st.status("Running PBF conversion...", expanded=True) as status_box:
+                    try:
+                        st.write(
+                            f"Checking {dynamic_input_path} for .DAT file matching "
+                            f"{file_name}*{cycle}{stream}{iteration}*.DAT"
+                        )
+                        matched_dat = _pbf_find_input_dat(
+                            username=st.session_state.get("pbf_username", ""),
+                            password=st.session_state.get("pbf_password", ""),
+                            file_name=file_name.strip(),
+                            cycle=cycle.strip(),
+                            stream=stream.strip(),
+                            iteration=iteration.strip(),
+                            dynamic_input_path=dynamic_input_path.strip(),
+                        )
+                        st.write(f"Input file found: {matched_dat}")
+                        st.write("Running remote conversion script...")
 
-                    file_bytes, csv_name, remote_csv_path = _pbf_run_conversion(
-                        username=st.session_state.get("pbf_username", ""),
-                        password=st.session_state.get("pbf_password", ""),
-                        file_name=file_name.strip(),
-                        cycle=cycle.strip(),
-                        stream=stream.strip(),
-                        iteration=iteration.strip(),
-                        dynamic_input_path=dynamic_input_path.strip(),
-                        matched_dat=matched_dat,
-                    )
+                        file_bytes, csv_name, remote_csv_path = _pbf_run_conversion(
+                            username=st.session_state.get("pbf_username", ""),
+                            password=st.session_state.get("pbf_password", ""),
+                            file_name=file_name.strip(),
+                            cycle=cycle.strip(),
+                            stream=stream.strip(),
+                            iteration=iteration.strip(),
+                            dynamic_input_path=dynamic_input_path.strip(),
+                            matched_dat=matched_dat,
+                        )
 
-                    st.session_state.pbf_download_bytes = file_bytes
-                    st.session_state.pbf_download_name = csv_name
-                    st.session_state.pbf_download_remote_path = remote_csv_path
-                    status_box.update(label="PBF conversion completed", state="complete", expanded=False)
-                except RuntimeError as exc:
-                    st.session_state.pbf_run_error = str(exc)
-                    status_box.update(label="PBF conversion failed", state="error", expanded=True)
-                except Exception as exc:
-                    if paramiko is not None and isinstance(exc, paramiko.AuthenticationException):
-                        st.session_state.pbf_run_error = "Authentication failed during conversion run."
-                    elif isinstance(exc, (socket.timeout, socket.gaierror)):
-                        st.session_state.pbf_run_error = f"Network error: {exc}"
-                    else:
-                        st.session_state.pbf_run_error = f"Unexpected error: {exc}"
-                    status_box.update(label="PBF conversion failed", state="error", expanded=True)
+                        st.session_state.pbf_download_bytes = file_bytes
+                        st.session_state.pbf_download_name = csv_name
+                        st.session_state.pbf_download_remote_path = remote_csv_path
+                        status_box.update(label="PBF conversion completed", state="complete", expanded=False)
+                    except RuntimeError as exc:
+                        st.session_state.pbf_run_error = str(exc)
+                        status_box.update(label="PBF conversion failed", state="error", expanded=True)
+                    except Exception as exc:
+                        if paramiko is not None and isinstance(exc, paramiko.AuthenticationException):
+                            st.session_state.pbf_run_error = "Authentication failed during conversion run."
+                        elif isinstance(exc, (socket.timeout, socket.gaierror)):
+                            st.session_state.pbf_run_error = f"Network error: {exc}"
+                        else:
+                            st.session_state.pbf_run_error = f"Unexpected error: {exc}"
+                        status_box.update(label="PBF conversion failed", state="error", expanded=True)
+            else:
+                jobs = [(s, i) for s in batch_streams for i in batch_iterations]
+                batch_results: list[dict[str, str]] = []
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                    with st.status("Running PBF scheduler...", expanded=True) as status_box:
+                        progress = st.progress(0)
+                        try:
+                            for idx, (run_stream, run_iteration) in enumerate(jobs, start=1):
+                                padded_iteration = run_iteration.zfill(2)
+                                st.write(f"[{idx}/{len(jobs)}] Stream={run_stream}, Iteration={padded_iteration}")
+                                try:
+                                    matched_dat = _pbf_find_input_dat(
+                                        username=st.session_state.get("pbf_username", ""),
+                                        password=st.session_state.get("pbf_password", ""),
+                                        file_name=file_name.strip(),
+                                        cycle=cycle.strip(),
+                                        stream=run_stream,
+                                        iteration=padded_iteration,
+                                        dynamic_input_path=dynamic_input_path.strip(),
+                                    )
+                                    file_bytes, csv_name, remote_csv_path = _pbf_run_conversion(
+                                        username=st.session_state.get("pbf_username", ""),
+                                        password=st.session_state.get("pbf_password", ""),
+                                        file_name=file_name.strip(),
+                                        cycle=cycle.strip(),
+                                        stream=run_stream,
+                                        iteration=padded_iteration,
+                                        dynamic_input_path=dynamic_input_path.strip(),
+                                        matched_dat=matched_dat,
+                                        download_output=True,
+                                    )
+                                    if file_bytes is not None:
+                                        zip_file.writestr(csv_name, file_bytes)
+                                    batch_results.append(
+                                        {
+                                            "stream": run_stream,
+                                            "iteration": padded_iteration,
+                                            "status": "Success",
+                                            "input_dat": matched_dat,
+                                            "output_csv": csv_name,
+                                            "remote_output_path": remote_csv_path,
+                                        }
+                                    )
+                                except Exception as combo_exc:
+                                    batch_results.append(
+                                        {
+                                            "stream": run_stream,
+                                            "iteration": padded_iteration,
+                                            "status": "Failed",
+                                            "input_dat": "",
+                                            "output_csv": "",
+                                            "remote_output_path": "",
+                                            "error": str(combo_exc),
+                                        }
+                                    )
+
+                                progress.progress(min(idx / len(jobs), 1.0))
+
+                            success_count = len([row for row in batch_results if row.get("status") == "Success"])
+                            fail_count = len(batch_results) - success_count
+                            if success_count:
+                                st.session_state.pbf_batch_zip_bytes = zip_buffer.getvalue()
+                            st.session_state.pbf_batch_results = batch_results
+                            status_box.update(
+                                label=f"Scheduler completed: {success_count} success, {fail_count} failed",
+                                state="complete" if fail_count == 0 else "error",
+                                expanded=fail_count > 0,
+                            )
+                        except Exception as exc:
+                            st.session_state.pbf_run_error = f"Scheduler failed unexpectedly: {exc}"
+                            status_box.update(label="PBF scheduler failed", state="error", expanded=True)
 
     if st.session_state.get("pbf_run_error"):
         st.error(st.session_state.pbf_run_error)
@@ -675,6 +791,21 @@ def render_pbf_conversion_tab() -> None:
             mime="text/csv",
             type="primary",
         )
+
+    batch_results = st.session_state.get("pbf_batch_results") or []
+    if batch_results:
+        st.subheader("Scheduler results")
+        result_df = pd.DataFrame(batch_results)
+        st.dataframe(result_df, use_container_width=True)
+
+        if st.session_state.get("pbf_batch_zip_bytes"):
+            st.download_button(
+                label="Download all successful CSV files (.zip)",
+                data=st.session_state.get("pbf_batch_zip_bytes"),
+                file_name=f"PBF_scheduler_outputs_{int(time.time())}.zip",
+                mime="application/zip",
+                type="primary",
+            )
 
 
 def auth_enabled() -> bool:
