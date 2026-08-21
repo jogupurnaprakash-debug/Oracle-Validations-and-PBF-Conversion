@@ -190,6 +190,9 @@ def _mainframe_init_state() -> None:
         "mf_operation": MAINFRAME_OPERATIONS[0],
         "mf_jcl_input_mode": "Paste JCL",
         "mf_last_result": None,
+        "mf_connected": False,
+        "mf_connected_user": "",
+        "mf_connection_message": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -331,6 +334,31 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -
     }
 
 
+def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str]:
+    """Attempt a lightweight API call to verify TSO credentials/session readiness."""
+    try:
+        response = requests.post(
+            MAINFRAME_API_URL,
+            headers=_mainframe_headers(user_id, password),
+            json=_mainframe_payload("PING", "health_check"),
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, f"Connection failed: {exc}"
+
+    if response.status_code == 401:
+        return False, "Unauthorized: invalid TSO credentials."
+
+    # Some backends may reject PING as an unsupported operation but still confirm auth/session.
+    if response.status_code in {400, 404, 405}:
+        return True, "Connected to TSO gateway."
+
+    if response.ok:
+        return True, "Connected to TSO gateway."
+
+    return False, f"Connection failed with HTTP {response.status_code}."
+
+
 def render_mainframe_operations_tab() -> None:
     _mainframe_init_state()
 
@@ -354,6 +382,37 @@ def render_mainframe_operations_tab() -> None:
                 placeholder="Enter TSO password",
             )
 
+        action_col1, action_col2 = st.columns([1, 1])
+        if action_col1.button("Connect TSO", type="primary", icon=":material/link:"):
+            if not tso_user_id.strip() or not tso_password:
+                st.error("Enter TSO User ID and TSO Password before connecting.")
+            else:
+                with st.spinner("Connecting to TSO gateway..."):
+                    ok, message = _mainframe_connect(tso_user_id.strip(), tso_password)
+                st.session_state.mf_connected = ok
+                st.session_state.mf_connected_user = tso_user_id.strip() if ok else ""
+                st.session_state.mf_connection_message = message
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
+
+        if action_col2.button("Disconnect TSO", icon=":material/link_off:"):
+            st.session_state.mf_connected = False
+            st.session_state.mf_connected_user = ""
+            st.session_state.mf_connection_message = "Disconnected."
+
+        if st.session_state.get("mf_connected"):
+            st.success(f"Connected as {st.session_state.get('mf_connected_user', 'user')}")
+        elif st.session_state.get("mf_connection_message"):
+            st.info(st.session_state.get("mf_connection_message"))
+
+    # Force reconnect if credentials were modified after a successful connection.
+    if st.session_state.get("mf_connected") and tso_user_id.strip() != st.session_state.get("mf_connected_user", ""):
+        st.session_state.mf_connected = False
+        st.session_state.mf_connected_user = ""
+        st.session_state.mf_connection_message = "Credentials changed. Please reconnect to TSO."
+
     operation = st.selectbox(
         "Operation",
         options=MAINFRAME_OPERATIONS,
@@ -373,6 +432,7 @@ def render_mainframe_operations_tab() -> None:
     with st.form("mainframe_operations_form"):
         data_value = ""
         jcl_input_mode = st.session_state.get("mf_jcl_input_mode", "Paste JCL")
+        ops_disabled = not st.session_state.get("mf_connected")
 
         if operation == "Run SPUFI Query":
             data_value = st.text_area(
@@ -380,12 +440,14 @@ def render_mainframe_operations_tab() -> None:
                 key="mf_sql_text",
                 placeholder="SELECT * FROM DB2_TABLE FETCH FIRST 10 ROWS ONLY",
                 height=180,
+                disabled=ops_disabled,
             )
         elif operation == "Validate Table":
             data_value = st.text_input(
                 "DB2 Table Name",
                 key="mf_table_name",
                 placeholder="DB2SCHEMA.TABLE_NAME",
+                disabled=ops_disabled,
             )
         elif operation == "Submit JCL":
             jcl_input_mode = st.radio(
@@ -393,6 +455,7 @@ def render_mainframe_operations_tab() -> None:
                 options=["Paste JCL", "Upload JCL file"],
                 horizontal=True,
                 key="mf_jcl_input_mode",
+                disabled=ops_disabled,
             )
             if jcl_input_mode == "Paste JCL":
                 data_value = st.text_area(
@@ -400,12 +463,14 @@ def render_mainframe_operations_tab() -> None:
                     key="mf_jcl_text",
                     placeholder="//JOBNAME JOB ...",
                     height=220,
+                    disabled=ops_disabled,
                 )
             else:
                 jcl_file = st.file_uploader(
                     "JCL file",
                     type=["jcl", "txt", "job"],
                     key="mf_jcl_file",
+                    disabled=ops_disabled,
                 )
                 if jcl_file is not None:
                     data_value = jcl_file.read().decode("utf-8", errors="replace")
@@ -414,12 +479,25 @@ def render_mainframe_operations_tab() -> None:
                 "Mainframe Dataset Name (DSN)",
                 key="mf_dataset_name",
                 placeholder="HLQ.DATASET.NAME",
+                disabled=ops_disabled,
             )
 
         action_label = operation_to_button.get(operation, "Execute")
-        submit_clicked = st.form_submit_button(action_label, type="primary", icon=":material/play_arrow:")
+        submit_clicked = st.form_submit_button(
+            action_label,
+            type="primary",
+            icon=":material/play_arrow:",
+            disabled=ops_disabled,
+        )
+
+    if not st.session_state.get("mf_connected"):
+        st.warning("Connect to TSO first, then run operations.")
 
     if submit_clicked:
+        if not st.session_state.get("mf_connected"):
+            st.error("TSO is not connected. Connect first.")
+            return
+
         missing = []
         if not tso_user_id.strip():
             missing.append("TSO User ID")
