@@ -1225,6 +1225,11 @@ def _reset_mode_selection() -> None:
     st.session_state.pbf_connected = False
     st.session_state.pbf_username = ""
     st.session_state.pbf_password = ""
+    st.session_state.mf_user_id = ""
+    st.session_state.mf_password = ""
+    st.session_state.mf_operation = MAINFRAME_OPERATIONS[0]
+    st.session_state.mf_jcl_input_mode = "Paste JCL"
+    st.session_state.mf_last_result = None
 
 
 def render_mode_selector() -> str:
@@ -1232,13 +1237,13 @@ def render_mode_selector() -> str:
         st.session_state.workbench_mode = ""
 
     mode = st.session_state.workbench_mode
-    if mode in {"oracle", "pbf"}:
+    if mode in {"oracle", "pbf", "mainframe"}:
         return mode
 
     st.title("Validation and PBF workbench")
     st.caption("Choose one login path to continue.")
 
-    oracle_col, pbf_col = st.columns(2)
+    oracle_col, pbf_col, mainframe_col = st.columns(3)
 
     with oracle_col:
         with st.container(border=True):
@@ -1257,6 +1262,15 @@ def render_mode_selector() -> str:
                 _pbf_init_state()
                 st.rerun()
 
+    with mainframe_col:
+        with st.container(border=True):
+            st.subheader("Mainframe operations")
+            st.caption("Authenticate with TSO credentials and use the mainframe API.")
+            if st.button("Login to Mainframe", type="primary", icon=":material/storage:"):
+                st.session_state.workbench_mode = "mainframe"
+                _mainframe_init_state()
+                st.rerun()
+
     st.stop()
 
 
@@ -1265,7 +1279,11 @@ def render_mode_switch_header() -> None:
     if not mode:
         return
 
-    mode_label = "Oracle DB" if mode == "oracle" else "PBF conversion"
+    mode_label = {
+        "oracle": "Oracle DB",
+        "pbf": "PBF conversion",
+        "mainframe": "Mainframe operations",
+    }.get(mode, mode)
     with st.container(horizontal=True, horizontal_alignment="right"):
         st.caption(f"Mode: {mode_label}")
         if st.button("Switch login", icon=":material/swap_horiz:"):
@@ -4123,6 +4141,14 @@ def main() -> None:
         render_mode_switch_header()
         st.caption("Login with Unix credentials to run PBF conversion.")
         render_pbf_conversion_tab()
+        return
+
+    if selected_mode == "mainframe":
+        _mainframe_init_state()
+        st.title("Mainframe operations workbench")
+        render_mode_switch_header()
+        st.caption("Authenticate with TSO credentials and run mainframe operations through the HTTP API.")
+        render_mainframe_operations_tab()
         return
 
     ensure_oracle_authenticated()
