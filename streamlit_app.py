@@ -141,6 +141,12 @@ PBF_REMOTE_OUT_DIR = os.getenv(
     "PBF_REMOTE_OUT_DIR",
     "/opt/IBM/SPARK/SPARK/hijackProject/pbfProject/ebcToAscConversionProject/out",
 )
+INTERNAL_WORKBENCH_URL = os.getenv("INTERNAL_WORKBENCH_URL", "http://63.10.106.182:8502/")
+PBF_PRIVATE_DOMAIN_SUFFIXES = [
+    suffix.strip().lower()
+    for suffix in os.getenv("PBF_PRIVATE_DOMAIN_SUFFIXES", "ebiz.verizon.com").split(",")
+    if suffix.strip()
+]
 PBF_PBRUN_CMD = "pbrun wasadmin\n"
 PBF_PBRUN_TIMEOUT = 20
 PBF_SCRIPT_TIMEOUT = 300
@@ -161,6 +167,54 @@ def _pbf_init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+@st.cache_data(ttl="5m", show_spinner=False)
+def _pbf_resolve_host(hostname: str, port: int) -> dict[str, Any]:
+    try:
+        addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        resolved_hosts = sorted({item[4][0] for item in addresses if item[4]})
+        return {"ok": True, "addresses": resolved_hosts, "error": ""}
+    except socket.gaierror as exc:
+        return {"ok": False, "addresses": [], "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "addresses": [], "error": str(exc)}
+
+
+def _pbf_host_looks_internal(hostname: str) -> bool:
+    lowered = hostname.strip().lower()
+    if not lowered:
+        return False
+    if "." not in lowered:
+        return True
+    return any(lowered.endswith(suffix) for suffix in PBF_PRIVATE_DOMAIN_SUFFIXES)
+
+
+def _render_pbf_connectivity_notice() -> bool:
+    lookup = _pbf_resolve_host(PBF_HOST, PBF_PORT)
+    if lookup["ok"]:
+        with st.container(border=True):
+            st.caption(f"Remote host: {PBF_HOST}:{PBF_PORT}")
+            st.caption(f"Resolved address(es): {', '.join(lookup['addresses'])}")
+        return True
+
+    internal_hint = _pbf_host_looks_internal(PBF_HOST)
+    with st.container(border=True):
+        st.error(
+            f"Unable to resolve PBF host {PBF_HOST}:{PBF_PORT} from this deployment environment. "
+            f"Connection error: {lookup['error']}"
+        )
+        if internal_hint:
+            st.warning(
+                "This PBF host appears to be on a private/internal network. Public Streamlit Cloud deployments "
+                "cannot reach it unless DNS and SSH access are exposed externally."
+            )
+        st.markdown(f"Use the internal deployment instead: {INTERNAL_WORKBENCH_URL}")
+        st.caption(
+            "To make the cloud deployment work, point PBF_HOST to a publicly reachable SSH host or deploy this app "
+            "inside the same internal network as the current working environment."
+        )
+    return False
 
 
 def _pbf_make_ssh_client(username: str, password: str) -> Any:
@@ -384,7 +438,7 @@ def render_pbf_conversion_tab() -> None:
     _pbf_init_state()
 
     st.subheader("PBF conversion")
-    st.caption(f"Target host: {PBF_HOST}:{PBF_PORT}")
+    host_available = _render_pbf_connectivity_notice()
 
     creds_col, status_col = st.columns([2, 1])
     with creds_col:
@@ -400,7 +454,12 @@ def render_pbf_conversion_tab() -> None:
                 value=st.session_state.get("pbf_password", ""),
                 placeholder="Enter Unix password",
             )
-            connect_btn = st.form_submit_button("Connect", type="primary", icon=":material/link:")
+            connect_btn = st.form_submit_button(
+                "Connect",
+                type="primary",
+                icon=":material/link:",
+                disabled=not host_available,
+            )
 
     with status_col:
         st.markdown("**Connection status**")
@@ -460,10 +519,10 @@ def render_pbf_conversion_tab() -> None:
             "Run conversion",
             type="primary",
             icon=":material/play_arrow:",
-            disabled=not st.session_state.get("pbf_connected"),
+            disabled=not st.session_state.get("pbf_connected") or not host_available,
         )
 
-    if not st.session_state.get("pbf_connected"):
+    if host_available and not st.session_state.get("pbf_connected"):
         st.warning("Connect with Unix credentials before running conversion.")
 
     if run_btn:
