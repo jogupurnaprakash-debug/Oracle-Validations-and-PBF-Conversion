@@ -156,6 +156,7 @@ PBF_SCRIPT_TIMEOUT = 300
 MAINFRAME_API_URL = os.getenv("MAINFRAME_API_URL", "http://tpaldrbmva122.ebiz.verizon.com:8051/mcp")
 MAINFRAME_HOST = os.getenv("MAINFRAME_HOST", "tpxvdsi.north.vzwcorp.com")
 MAINFRAME_REGION = os.getenv("MAINFRAME_REGION", "B")
+MAINFRAME_PROTOCOL_VERSION = os.getenv("MAINFRAME_PROTOCOL_VERSION", "2024-11-05")
 MAINFRAME_OPERATIONS = [
     "Run SPUFI Query",
     "Validate Table",
@@ -193,14 +194,15 @@ def _mainframe_init_state() -> None:
         "mf_connected": False,
         "mf_connected_user": "",
         "mf_connection_message": "",
+        "mf_session_id": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def _mainframe_headers(user_id: str, password: str) -> dict[str, str]:
-    return {
+def _mainframe_headers(user_id: str, password: str, session_id: str = "") -> dict[str, str]:
+    headers = {
         "X-MF-User": user_id,
         "X-MF-Password": password,
         "X-MF-Host": MAINFRAME_HOST,
@@ -208,6 +210,9 @@ def _mainframe_headers(user_id: str, password: str) -> dict[str, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    if session_id.strip():
+        headers["mcp-session-id"] = session_id.strip()
+    return headers
 
 
 def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
@@ -240,10 +245,11 @@ def _mainframe_post_jsonrpc(
     params: dict[str, Any],
     request_id: str,
     timeout: int,
+    session_id: str = "",
 ) -> requests.Response:
     return requests.post(
         MAINFRAME_API_URL,
-        headers=_mainframe_headers(user_id, password),
+        headers=_mainframe_headers(user_id, password, session_id=session_id),
         json=_mainframe_jsonrpc_message(method, params, request_id),
         timeout=timeout,
     )
@@ -324,7 +330,16 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
         st.info("No response body returned.")
 
 
-def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -> dict[str, Any]:
+def _mainframe_execute(operation: str, data: str, user_id: str, password: str, session_id: str) -> dict[str, Any]:
+    if not session_id.strip():
+        return {
+            "ok": False,
+            "status_code": 400,
+            "response_json": None,
+            "raw_text": "",
+            "error": "Missing session ID. Please reconnect to TSO.",
+        }
+
     attempts: list[tuple[str, dict[str, Any], str]] = [
         ("mainframe.execute", _mainframe_payload(operation, data), "mf-op-1"),
         ("execute", _mainframe_payload(operation, data), "mf-op-2"),
@@ -353,6 +368,7 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -
                 params=params,
                 request_id=request_id,
                 timeout=120,
+                session_id=session_id,
             )
         except requests.exceptions.RequestException as exc:
             return {
@@ -420,35 +436,69 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -
     }
 
 
-def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str]:
-    """Attempt a lightweight API call to verify TSO credentials/session readiness."""
+def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str]:
+    """Initialize MCP session and verify TSO credentials/session readiness."""
     try:
-        response = _mainframe_post_jsonrpc(
+        init_response = _mainframe_post_jsonrpc(
+            user_id=user_id,
+            password=password,
+            method="initialize",
+            params={
+                "protocolVersion": MAINFRAME_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "oracle-validation-workbench", "version": "1.0.0"},
+            },
+            request_id="mf-init",
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, f"Connection failed: {exc}", ""
+
+    if init_response.status_code == 401:
+        return False, "Unauthorized: invalid TSO credentials.", ""
+
+    init_json = _mainframe_safe_json(init_response)
+    init_error = _extract_jsonrpc_error_message(init_json)
+    if init_error:
+        return False, init_error, ""
+
+    session_id = (
+        init_response.headers.get("mcp-session-id")
+        or init_response.headers.get("Mcp-Session-Id")
+        or ""
+    ).strip()
+
+    if not session_id:
+        return False, "Connection failed: server did not provide a session ID.", ""
+
+    try:
+        list_response = _mainframe_post_jsonrpc(
             user_id=user_id,
             password=password,
             method="tools/list",
             params={},
             request_id="mf-connect",
             timeout=30,
+            session_id=session_id,
         )
     except requests.exceptions.RequestException as exc:
-        return False, f"Connection failed: {exc}"
+        return False, f"Connection failed: {exc}", ""
 
-    if response.status_code == 401:
-        return False, "Unauthorized: invalid TSO credentials."
+    if list_response.status_code == 401:
+        return False, "Unauthorized: invalid TSO credentials.", ""
 
     # Some gateways reject tools/list but still prove reachability/auth on these status codes.
-    if response.status_code in {400, 404, 405, 406}:
-        return True, "Connected to TSO gateway."
+    if list_response.status_code in {400, 404, 405, 406}:
+        return True, "Connected to TSO gateway.", session_id
 
-    if response.ok:
-        body = _mainframe_safe_json(response)
+    if list_response.ok:
+        body = _mainframe_safe_json(list_response)
         jsonrpc_error = _extract_jsonrpc_error_message(body)
         if jsonrpc_error:
-            return False, jsonrpc_error
-        return True, "Connected to TSO gateway."
+            return False, jsonrpc_error, ""
+        return True, "Connected to TSO gateway.", session_id
 
-    return False, f"Connection failed with HTTP {response.status_code}."
+    return False, f"Connection failed with HTTP {list_response.status_code}.", ""
 
 
 def render_mainframe_operations_tab() -> None:
@@ -480,10 +530,11 @@ def render_mainframe_operations_tab() -> None:
                 st.error("Enter TSO User ID and TSO Password before connecting.")
             else:
                 with st.spinner("Connecting to TSO gateway..."):
-                    ok, message = _mainframe_connect(tso_user_id.strip(), tso_password)
+                    ok, message, session_id = _mainframe_connect(tso_user_id.strip(), tso_password)
                 st.session_state.mf_connected = ok
                 st.session_state.mf_connected_user = tso_user_id.strip() if ok else ""
                 st.session_state.mf_connection_message = message
+                st.session_state.mf_session_id = session_id if ok else ""
                 if ok:
                     st.success(message)
                 else:
@@ -493,6 +544,7 @@ def render_mainframe_operations_tab() -> None:
             st.session_state.mf_connected = False
             st.session_state.mf_connected_user = ""
             st.session_state.mf_connection_message = "Disconnected."
+            st.session_state.mf_session_id = ""
 
         if st.session_state.get("mf_connected"):
             st.success(f"Connected as {st.session_state.get('mf_connected_user', 'user')}")
@@ -504,6 +556,7 @@ def render_mainframe_operations_tab() -> None:
         st.session_state.mf_connected = False
         st.session_state.mf_connected_user = ""
         st.session_state.mf_connection_message = "Credentials changed. Please reconnect to TSO."
+        st.session_state.mf_session_id = ""
 
     operation = st.selectbox(
         "Operation",
@@ -602,7 +655,13 @@ def render_mainframe_operations_tab() -> None:
             st.error(f"Please fill in: {', '.join(missing)}")
         else:
             with st.spinner(f"{action_label} in progress..."):
-                result = _mainframe_execute(operation, data_value.strip(), tso_user_id.strip(), tso_password)
+                result = _mainframe_execute(
+                    operation,
+                    data_value.strip(),
+                    tso_user_id.strip(),
+                    tso_password,
+                    st.session_state.get("mf_session_id", ""),
+                )
                 st.session_state.mf_last_result = result
 
     result = st.session_state.get("mf_last_result")
