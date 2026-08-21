@@ -196,6 +196,8 @@ def _mainframe_init_state() -> None:
         "mf_connected_user": "",
         "mf_connection_message": "",
         "mf_session_id": "",
+        "mf_tool_name": "",
+        "mf_available_tools": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -269,6 +271,84 @@ def _extract_mcp_result_error_message(result_body: Any) -> str:
     if isinstance(fallback, str) and fallback.strip():
         return fallback.strip()
     return ""
+
+
+def _mainframe_extract_tool_names(body: Any) -> list[str]:
+    if not isinstance(body, dict):
+        return []
+
+    result = body.get("result")
+    candidates: list[Any] = []
+    if isinstance(result, dict):
+        tools_value = result.get("tools")
+        if isinstance(tools_value, list):
+            candidates.extend(tools_value)
+    elif isinstance(result, list):
+        candidates.extend(result)
+
+    tool_names: list[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                tool_names.append(name.strip())
+        elif isinstance(item, str) and item.strip():
+            tool_names.append(item.strip())
+
+    # Preserve order while removing duplicates.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for name in tool_names:
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(name)
+    return deduped
+
+
+def _mainframe_tool_aliases() -> list[str]:
+    configured = os.getenv("MAINFRAME_TOOL_NAME", "").strip()
+    aliases = [
+        configured,
+        "mainframe_operations",
+        "mainframe-operation",
+        "mainframe_operation",
+        "mainframe-operations",
+        "mainframe",
+        "tso_operations",
+        "tso-operations",
+    ]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        if not alias:
+            continue
+        lowered = alias.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        ordered.append(alias)
+    return ordered
+
+
+def _resolve_mainframe_tool_name(discovered_names: list[str]) -> str:
+    if not discovered_names:
+        return ""
+
+    preferred_aliases = [name.lower() for name in _mainframe_tool_aliases()]
+    for alias in preferred_aliases:
+        for discovered in discovered_names:
+            if discovered.lower() == alias:
+                return discovered
+
+    # Fall back to a likely operation tool if aliases did not match exactly.
+    for discovered in discovered_names:
+        lowered = discovered.lower()
+        if "mainframe" in lowered or "tso" in lowered or "operation" in lowered:
+            return discovered
+
+    return discovered_names[0]
 
 
 def _mainframe_post_jsonrpc(
@@ -375,7 +455,14 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
         st.info("No response body returned.")
 
 
-def _mainframe_execute(operation: str, data: str, user_id: str, password: str, session_id: str) -> dict[str, Any]:
+def _mainframe_execute(
+    operation: str,
+    data: str,
+    user_id: str,
+    password: str,
+    session_id: str,
+    tool_name: str = "",
+) -> dict[str, Any]:
     if not session_id.strip():
         return {
             "ok": False,
@@ -385,26 +472,37 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str, s
             "error": "Missing session ID. Please reconnect to TSO.",
         }
 
-    attempts: list[tuple[str, dict[str, Any], str]] = [
-        ("mainframe.execute", _mainframe_payload(operation, data), "mf-op-1"),
-        ("execute", _mainframe_payload(operation, data), "mf-op-2"),
-        ("run_operation", _mainframe_payload(operation, data), "mf-op-3"),
-        (
-            "tools/call",
-            {
-                "name": os.getenv("MAINFRAME_TOOL_NAME", "mainframe_operations"),
-                "arguments": _mainframe_payload(operation, data),
-            },
-            "mf-op-4",
-        ),
+    payload = _mainframe_payload(operation, data)
+    attempts: list[tuple[str, dict[str, Any], str, str]] = [
+        ("mainframe.execute", payload, "mf-op-1", ""),
+        ("execute", payload, "mf-op-2", ""),
+        ("run_operation", payload, "mf-op-3", ""),
     ]
+
+    tool_candidates: list[str] = []
+    for candidate in [tool_name.strip(), *_mainframe_tool_aliases()]:
+        if candidate and candidate.lower() not in {item.lower() for item in tool_candidates}:
+            tool_candidates.append(candidate)
+
+    for index, candidate in enumerate(tool_candidates, start=1):
+        attempts.append(
+            (
+                "tools/call",
+                {
+                    "name": candidate,
+                    "arguments": payload,
+                },
+                f"mf-op-tool-{index}",
+                candidate,
+            )
+        )
 
     last_response: requests.Response | None = None
     last_json: Any | None = None
     last_raw_text = ""
     last_error_text = ""
 
-    for method, params, request_id in attempts:
+    for method, params, request_id, attempted_tool_name in attempts:
         try:
             response = _mainframe_post_jsonrpc(
                 user_id=user_id,
@@ -471,11 +569,15 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str, s
         if isinstance(success_body, dict) and success_body.get("isError") is True:
             mcp_error_text = _extract_mcp_result_error_message(success_body) or "Mainframe operation returned isError=true."
             last_error_text = mcp_error_text
+            unknown_tool = "unknown tool" in mcp_error_text.lower()
             retryable = (
                 "invalid params" in mcp_error_text.lower()
                 or "invalid request parameters" in mcp_error_text.lower()
                 or "method not found" in mcp_error_text.lower()
+                or unknown_tool
             )
+            if unknown_tool and method == "tools/call" and attempted_tool_name:
+                continue
             if retryable:
                 continue
             return {
@@ -505,7 +607,7 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str, s
     }
 
 
-def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str]:
+def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str, str, list[str]]:
     """Initialize MCP session and verify TSO credentials/session readiness."""
     try:
         init_response = _mainframe_post_jsonrpc(
@@ -521,15 +623,15 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str]:
             timeout=30,
         )
     except requests.exceptions.RequestException as exc:
-        return False, f"Connection failed: {exc}", ""
+        return False, f"Connection failed: {exc}", "", "", []
 
     if init_response.status_code == 401:
-        return False, "Unauthorized: invalid TSO credentials.", ""
+        return False, "Unauthorized: invalid TSO credentials.", "", "", []
 
     init_json = _mainframe_safe_json(init_response)
     init_error = _extract_jsonrpc_error_message(init_json)
     if init_error:
-        return False, init_error, ""
+        return False, init_error, "", "", []
 
     session_id = (
         init_response.headers.get("mcp-session-id")
@@ -538,7 +640,7 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str]:
     ).strip()
 
     if not session_id:
-        return False, "Connection failed: server did not provide a session ID.", ""
+        return False, "Connection failed: server did not provide a session ID.", "", "", []
 
     try:
         list_response = _mainframe_post_jsonrpc(
@@ -551,23 +653,29 @@ def _mainframe_connect(user_id: str, password: str) -> tuple[bool, str, str]:
             session_id=session_id,
         )
     except requests.exceptions.RequestException as exc:
-        return False, f"Connection failed: {exc}", ""
+        return False, f"Connection failed: {exc}", "", "", []
 
     if list_response.status_code == 401:
-        return False, "Unauthorized: invalid TSO credentials.", ""
+        return False, "Unauthorized: invalid TSO credentials.", "", "", []
 
     # Some gateways reject tools/list but still prove reachability/auth on these status codes.
     if list_response.status_code in {400, 404, 405, 406}:
-        return True, "Connected to TSO gateway.", session_id
+        fallback_tool = _mainframe_tool_aliases()[0] if _mainframe_tool_aliases() else ""
+        return True, "Connected to TSO gateway.", session_id, fallback_tool, []
 
     if list_response.ok:
         body = _mainframe_safe_json(list_response)
         jsonrpc_error = _extract_jsonrpc_error_message(body)
         if jsonrpc_error:
-            return False, jsonrpc_error, ""
-        return True, "Connected to TSO gateway.", session_id
+            return False, jsonrpc_error, "", "", []
+        available_tools = _mainframe_extract_tool_names(body)
+        tool_name = _resolve_mainframe_tool_name(available_tools)
+        if tool_name:
+            return True, f"Connected to TSO gateway. Selected tool: {tool_name}", session_id, tool_name, available_tools
+        fallback_tool = _mainframe_tool_aliases()[0] if _mainframe_tool_aliases() else ""
+        return True, "Connected to TSO gateway.", session_id, fallback_tool, available_tools
 
-    return False, f"Connection failed with HTTP {list_response.status_code}.", ""
+    return False, f"Connection failed with HTTP {list_response.status_code}.", "", "", []
 
 
 def render_mainframe_operations_tab() -> None:
@@ -600,11 +708,13 @@ def render_mainframe_operations_tab() -> None:
                 st.error("Enter TSO User ID and TSO Password before connecting.")
             else:
                 with st.spinner("Connecting to TSO gateway..."):
-                    ok, message, session_id = _mainframe_connect(tso_user_id.strip(), tso_password)
+                    ok, message, session_id, tool_name, available_tools = _mainframe_connect(tso_user_id.strip(), tso_password)
                 st.session_state.mf_connected = ok
                 st.session_state.mf_connected_user = tso_user_id.strip() if ok else ""
                 st.session_state.mf_connection_message = message
                 st.session_state.mf_session_id = session_id if ok else ""
+                st.session_state.mf_tool_name = tool_name if ok else ""
+                st.session_state.mf_available_tools = available_tools if ok else []
                 if ok:
                     st.success(message)
                 else:
@@ -615,6 +725,8 @@ def render_mainframe_operations_tab() -> None:
             st.session_state.mf_connected_user = ""
             st.session_state.mf_connection_message = "Disconnected."
             st.session_state.mf_session_id = ""
+            st.session_state.mf_tool_name = ""
+            st.session_state.mf_available_tools = []
 
         if st.session_state.get("mf_connected"):
             st.success(f"Connected as {st.session_state.get('mf_connected_user', 'user')}")
@@ -627,6 +739,8 @@ def render_mainframe_operations_tab() -> None:
         st.session_state.mf_connected_user = ""
         st.session_state.mf_connection_message = "Credentials changed. Please reconnect to TSO."
         st.session_state.mf_session_id = ""
+        st.session_state.mf_tool_name = ""
+        st.session_state.mf_available_tools = []
 
     operation = st.selectbox(
         "Operation",
@@ -731,6 +845,7 @@ def render_mainframe_operations_tab() -> None:
                     tso_user_id.strip(),
                     tso_password,
                     st.session_state.get("mf_session_id", ""),
+                    st.session_state.get("mf_tool_name", ""),
                 )
                 st.session_state.mf_last_result = result
 
