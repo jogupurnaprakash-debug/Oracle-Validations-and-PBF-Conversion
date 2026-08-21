@@ -238,6 +238,16 @@ def _extract_jsonrpc_error_message(body: Any) -> str:
     return ""
 
 
+def _extract_jsonrpc_error_code(body: Any) -> int | None:
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            if isinstance(code, int):
+                return code
+    return None
+
+
 def _mainframe_post_jsonrpc(
     user_id: str,
     password: str,
@@ -403,8 +413,13 @@ def _mainframe_execute(operation: str, data: str, user_id: str, password: str, s
         jsonrpc_error = _extract_jsonrpc_error_message(response_json)
         if jsonrpc_error:
             last_error_text = jsonrpc_error
+            jsonrpc_code = _extract_jsonrpc_error_code(response_json)
             method_not_found = "method not found" in jsonrpc_error.lower()
-            invalid_params = "invalid params" in jsonrpc_error.lower()
+            invalid_params = (
+                "invalid params" in jsonrpc_error.lower()
+                or "invalid request parameters" in jsonrpc_error.lower()
+                or jsonrpc_code == -32602
+            )
             if method_not_found or invalid_params:
                 continue
             return {
