@@ -165,6 +165,18 @@ MAINFRAME_OPERATIONS = [
     "Submit JCL",
     "View Dataset",
 ]
+MAINFRAME_SPUFI_COLUMNS = [
+    "BL_CYC_NO",
+    "MDN",
+    "ECPD_PROFILE_ID",
+    "CUST_ID_NO",
+    "ACCT_NO",
+    "ACTIVE_MTNS_QTY",
+    "SUPRS_ADV_BL_IND",
+    "MIGR_TGT_PHASE_CD",
+    "VIS2_MIGR_END_DT",
+    "DB_TMSTAMP",
+]
 
 _ACTIVE_PROGRESS_TRACKER: ProgressTracker | None = None
 
@@ -600,6 +612,52 @@ def _mainframe_operation_prefers_table(operation: str) -> bool:
     return operation in {"Run SPUFI Query", "Validate Table"}
 
 
+def _mainframe_csv_filename(operation: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9]+", "_", operation.strip().lower()).strip("_")
+    safe = safe or "mainframe_result"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"{safe}_{stamp}.csv"
+
+
+def _mainframe_render_csv_download(table_df: pd.DataFrame, operation: str) -> None:
+    if table_df.empty:
+        return
+    csv_bytes = table_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name=_mainframe_csv_filename(operation),
+        mime="text/csv",
+        key=f"mf_csv_download_{operation}",
+    )
+
+
+def _mainframe_apply_preferred_columns(table_df: pd.DataFrame, operation: str) -> pd.DataFrame:
+    if table_df.empty:
+        return table_df
+
+    if operation != "Run SPUFI Query":
+        return table_df
+
+    normalized_map = {str(col).strip().upper(): col for col in table_df.columns}
+    selected: dict[str, Any] = {}
+
+    for header in MAINFRAME_SPUFI_COLUMNS:
+        source_col = normalized_map.get(header)
+        if source_col is not None:
+            selected[header] = table_df[source_col]
+        else:
+            selected[header] = ""
+
+    # Preserve unexpected extra columns after the required SPUFI order.
+    used_sources = {normalized_map.get(header) for header in MAINFRAME_SPUFI_COLUMNS}
+    extras = [col for col in table_df.columns if col not in used_sources]
+    for extra in extras:
+        selected[str(extra)] = table_df[extra]
+
+    return pd.DataFrame(selected)
+
+
 def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
     st.divider()
     st.subheader("API response")
@@ -624,16 +682,22 @@ def _mainframe_render_response(result: dict[str, Any], operation: str) -> None:
         return
 
     table_df = _mainframe_coerce_dataframe(response_json)
+    if table_df is not None and not table_df.empty:
+        table_df = _mainframe_apply_preferred_columns(table_df, operation)
 
     if _mainframe_operation_prefers_table(operation) and table_df is not None and not table_df.empty:
+        st.caption(f"Rows returned: {len(table_df)}")
         st.dataframe(table_df)
+        _mainframe_render_csv_download(table_df, operation)
         return
 
     if isinstance(response_json, (dict, list)):
         if table_df is not None and not table_df.empty and not _mainframe_operation_prefers_table(operation):
             with st.container(border=True):
                 st.caption("Structured response")
+                st.caption(f"Rows returned: {len(table_df)}")
                 st.dataframe(table_df)
+                _mainframe_render_csv_download(table_df, operation)
         else:
             st.json(response_json)
         return
