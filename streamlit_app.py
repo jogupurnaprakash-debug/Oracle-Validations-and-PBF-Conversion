@@ -205,6 +205,8 @@ def _mainframe_headers(user_id: str, password: str) -> dict[str, str]:
         "X-MF-Password": password,
         "X-MF-Host": MAINFRAME_HOST,
         "X-MF-Region": MAINFRAME_REGION,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
 
