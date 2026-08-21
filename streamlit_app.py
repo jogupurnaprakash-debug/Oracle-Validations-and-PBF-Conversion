@@ -236,7 +236,85 @@ def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
     return {"operation": operation, "data": data, "environment": MAINFRAME_ENV}
 
 
-def _mainframe_operation_argument_variants(operation: str, data: str) -> list[dict[str, Any]]:
+def _mainframe_copybook_map() -> dict[str, str]:
+    raw = os.getenv("MAINFRAME_COPYBOOK_MAP", "").strip()
+    if not raw:
+        return {}
+
+    parsed_map: dict[str, str] = {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if isinstance(key, str) and isinstance(value, str) and key.strip() and value.strip():
+                    parsed_map[key.strip().upper()] = value.strip()
+            return parsed_map
+    except Exception:
+        pass
+
+    for item in raw.split(","):
+        token = item.strip()
+        if not token or ":" not in token:
+            continue
+        left, right = token.split(":", 1)
+        key = left.strip().upper()
+        value = right.strip()
+        if key and value:
+            parsed_map[key] = value
+    return parsed_map
+
+
+def _mainframe_dataset_token(dataset_name: str) -> str:
+    cleaned = dataset_name.strip().strip("'").strip('"')
+    if not cleaned:
+        return ""
+
+    member_match = re.search(r"\(([^)]+)\)$", cleaned)
+    if member_match:
+        member = member_match.group(1).strip()
+        if member:
+            return member.upper()
+
+    qualifiers = [part for part in cleaned.split(".") if part]
+    if not qualifiers:
+        return ""
+    return qualifiers[-1].upper()
+
+
+def _mainframe_copybook_candidates(dataset_name: str, explicit_copybook: str = "") -> list[str]:
+    candidates: list[str] = []
+
+    if explicit_copybook.strip():
+        candidates.append(explicit_copybook.strip())
+
+    token = _mainframe_dataset_token(dataset_name)
+    mapping = _mainframe_copybook_map()
+    if token and token in mapping:
+        candidates.append(mapping[token])
+
+    # Common defaults based on input file name / dataset suffix.
+    if token:
+        candidates.extend([token, f"{token}_COPYBOOK", f"CPY_{token}"])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for name in candidates:
+        normalized = name.strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(normalized)
+    return deduped
+
+
+def _mainframe_operation_argument_variants(
+    operation: str,
+    data: str,
+    dataset_copybook: str = "",
+) -> list[dict[str, Any]]:
     normalized = data.strip()
     if not normalized:
         return [_mainframe_payload(operation, data)]
@@ -317,6 +395,7 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
             ]
         )
     elif operation == "View Dataset":
+        copybook_candidates = _mainframe_copybook_candidates(normalized, dataset_copybook)
         variants.extend(
             [
                 {
@@ -339,6 +418,32 @@ def _mainframe_operation_argument_variants(operation: str, data: str) -> list[di
                 {"operation": "view_dataset", "dataset": normalized, "environment": MAINFRAME_ENV},
             ]
         )
+
+        # Add copybook-aware variants so different files can be decoded correctly.
+        for copybook_name in copybook_candidates:
+            variants.extend(
+                [
+                    {
+                        "mode": "submit_dataset",
+                        "dataset": normalized,
+                        "copybook": copybook_name,
+                        "environment": MAINFRAME_ENV,
+                    },
+                    {
+                        "mode": "submit_dataset",
+                        "dataset": normalized,
+                        "copybook_name": copybook_name,
+                        "environment": MAINFRAME_ENV,
+                    },
+                    {
+                        "mode": "submit_and_wait",
+                        "operation": "View Dataset",
+                        "dataset": normalized,
+                        "copybook": copybook_name,
+                        "environment": MAINFRAME_ENV,
+                    },
+                ]
+            )
 
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -874,6 +979,7 @@ def _mainframe_execute(
     session_id: str,
     tool_name: str = "",
     available_tools: list[str] | None = None,
+    dataset_copybook: str = "",
 ) -> dict[str, Any]:
     if not session_id.strip():
         return {
@@ -885,7 +991,7 @@ def _mainframe_execute(
         }
 
     payload = _mainframe_payload(operation, data)
-    argument_variants = _mainframe_operation_argument_variants(operation, data)
+    argument_variants = _mainframe_operation_argument_variants(operation, data, dataset_copybook=dataset_copybook)
     attempts: list[tuple[str, dict[str, Any], str, str]] = [
         ("mainframe.execute", payload, "mf-op-1", ""),
         ("execute", payload, "mf-op-2", ""),
@@ -1262,6 +1368,13 @@ def render_mainframe_operations_tab() -> None:
                 placeholder="HLQ.DATASET.NAME",
                 disabled=ops_disabled,
             )
+            st.text_input(
+                "Copybook Name (optional)",
+                key="mf_dataset_copybook",
+                placeholder="AUTO from input file name or provide explicit copybook",
+                disabled=ops_disabled,
+            )
+            st.caption("Tip: Set MAINFRAME_COPYBOOK_MAP in env as JSON, e.g. {\"ALL\":\"SVCPRD_COPYBOOK\"} for auto file-to-copybook mapping.")
 
         action_label = operation_to_button.get(operation, "Execute")
         submit_clicked = st.form_submit_button(
@@ -1299,6 +1412,7 @@ def render_mainframe_operations_tab() -> None:
                     st.session_state.get("mf_session_id", ""),
                     st.session_state.get("mf_tool_name", ""),
                     st.session_state.get("mf_available_tools", []),
+                    st.session_state.get("mf_dataset_copybook", ""),
                 )
                 st.session_state.mf_last_result = result
 
