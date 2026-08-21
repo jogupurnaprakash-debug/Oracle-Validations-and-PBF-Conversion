@@ -15,6 +15,7 @@ from typing import Any
 
 import oracledb
 import pandas as pd
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -152,6 +153,16 @@ PBF_PBRUN_CMD = "pbrun wasadmin\n"
 PBF_PBRUN_TIMEOUT = 20
 PBF_SCRIPT_TIMEOUT = 300
 
+MAINFRAME_API_URL = os.getenv("MAINFRAME_API_URL", "http://tpaldrbmva122.ebiz.verizon.com:8051/mcp")
+MAINFRAME_HOST = os.getenv("MAINFRAME_HOST", "tpxvdsi.north.vzwcorp.com")
+MAINFRAME_REGION = os.getenv("MAINFRAME_REGION", "B")
+MAINFRAME_OPERATIONS = [
+    "Run SPUFI Query",
+    "Validate Table",
+    "Submit JCL",
+    "View Dataset",
+]
+
 _ACTIVE_PROGRESS_TRACKER: ProgressTracker | None = None
 
 
@@ -170,6 +181,247 @@ def _pbf_init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _mainframe_init_state() -> None:
+    defaults = {
+        "mf_user_id": "",
+        "mf_password": "",
+        "mf_operation": MAINFRAME_OPERATIONS[0],
+        "mf_jcl_input_mode": "Paste JCL",
+        "mf_last_result": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _mainframe_headers(user_id: str, password: str) -> dict[str, str]:
+    return {
+        "X-MF-User": user_id,
+        "X-MF-Password": password,
+        "X-MF-Host": MAINFRAME_HOST,
+        "X-MF-Region": MAINFRAME_REGION,
+    }
+
+
+def _mainframe_payload(operation: str, data: str) -> dict[str, str]:
+    return {"operation": operation, "data": data}
+
+
+def _mainframe_coerce_dataframe(response_json: Any) -> pd.DataFrame | None:
+    if isinstance(response_json, list):
+        if response_json and all(isinstance(item, dict) for item in response_json):
+            return pd.DataFrame(response_json)
+        return pd.DataFrame(response_json)
+
+    if isinstance(response_json, dict):
+        for key in ("rows", "data", "result", "results"):
+            value = response_json.get(key)
+            if isinstance(value, list):
+                if not value:
+                    return pd.DataFrame(value)
+                if all(isinstance(item, dict) for item in value):
+                    return pd.DataFrame(value)
+                return pd.DataFrame({key: value})
+
+        tabular_candidates = {
+            key: value
+            for key, value in response_json.items()
+            if not isinstance(value, (dict, list))
+        }
+        if tabular_candidates:
+            return pd.DataFrame([tabular_candidates])
+
+    return None
+
+
+def _mainframe_safe_json(resp: requests.Response) -> Any | None:
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def _mainframe_execute(operation: str, data: str, user_id: str, password: str) -> dict[str, Any]:
+    try:
+        response = requests.post(
+            MAINFRAME_API_URL,
+            headers=_mainframe_headers(user_id, password),
+            json=_mainframe_payload(operation, data),
+            timeout=120,
+        )
+    except requests.exceptions.RequestException as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "response_json": None,
+            "raw_text": "",
+            "error": f"Network error calling mainframe API: {exc}",
+        }
+
+    response_json = _mainframe_safe_json(response)
+    raw_text = response.text or ""
+
+    if response.status_code == 401:
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "response_json": response_json,
+            "raw_text": raw_text,
+            "error": "Unauthorized: invalid TSO credentials.",
+        }
+
+    if not response.ok:
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "response_json": response_json,
+            "raw_text": raw_text,
+            "error": f"Mainframe API returned HTTP {response.status_code}.",
+        }
+
+    return {
+        "ok": True,
+        "status_code": response.status_code,
+        "response_json": response_json,
+        "raw_text": raw_text,
+        "error": "",
+    }
+
+
+def render_mainframe_operations_tab() -> None:
+    _mainframe_init_state()
+
+    st.subheader("Mainframe Operations")
+    st.caption("Authenticate with TSO credentials and execute mainframe tasks through the central HTTP API.")
+
+    with st.container(border=True):
+        st.markdown("**Authentication**")
+        auth_col1, auth_col2 = st.columns(2)
+        with auth_col1:
+            tso_user_id = st.text_input(
+                "TSO User ID",
+                key="mf_user_id",
+                placeholder="Enter TSO user ID",
+            )
+        with auth_col2:
+            tso_password = st.text_input(
+                "TSO Password",
+                key="mf_password",
+                type="password",
+                placeholder="Enter TSO password",
+            )
+
+    operation = st.selectbox(
+        "Operation",
+        options=MAINFRAME_OPERATIONS,
+        index=MAINFRAME_OPERATIONS.index(st.session_state.get("mf_operation", MAINFRAME_OPERATIONS[0]))
+        if st.session_state.get("mf_operation", MAINFRAME_OPERATIONS[0]) in MAINFRAME_OPERATIONS
+        else 0,
+        key="mf_operation",
+    )
+
+    operation_to_button = {
+        "Run SPUFI Query": "Execute",
+        "Validate Table": "Validate",
+        "Submit JCL": "Submit",
+        "View Dataset": "View",
+    }
+
+    with st.form("mainframe_operations_form"):
+        data_value = ""
+        jcl_input_mode = st.session_state.get("mf_jcl_input_mode", "Paste JCL")
+
+        if operation == "Run SPUFI Query":
+            data_value = st.text_area(
+                "SQL",
+                key="mf_sql_text",
+                placeholder="SELECT * FROM DB2_TABLE FETCH FIRST 10 ROWS ONLY",
+                height=180,
+            )
+        elif operation == "Validate Table":
+            data_value = st.text_input(
+                "DB2 Table Name",
+                key="mf_table_name",
+                placeholder="DB2SCHEMA.TABLE_NAME",
+            )
+        elif operation == "Submit JCL":
+            jcl_input_mode = st.radio(
+                "JCL input source",
+                options=["Paste JCL", "Upload JCL file"],
+                horizontal=True,
+                key="mf_jcl_input_mode",
+            )
+            if jcl_input_mode == "Paste JCL":
+                data_value = st.text_area(
+                    "JCL code",
+                    key="mf_jcl_text",
+                    placeholder="//JOBNAME JOB ...",
+                    height=220,
+                )
+            else:
+                jcl_file = st.file_uploader(
+                    "JCL file",
+                    type=["jcl", "txt", "job"],
+                    key="mf_jcl_file",
+                )
+                if jcl_file is not None:
+                    data_value = jcl_file.read().decode("utf-8", errors="replace")
+        elif operation == "View Dataset":
+            data_value = st.text_input(
+                "Mainframe Dataset Name (DSN)",
+                key="mf_dataset_name",
+                placeholder="HLQ.DATASET.NAME",
+            )
+
+        action_label = operation_to_button.get(operation, "Execute")
+        submit_clicked = st.form_submit_button(action_label, type="primary", icon=":material/play_arrow:")
+
+    if submit_clicked:
+        missing = []
+        if not tso_user_id.strip():
+            missing.append("TSO User ID")
+        if not tso_password:
+            missing.append("TSO Password")
+        if not data_value.strip():
+            missing.append("Operation input")
+
+        if missing:
+            st.error(f"Please fill in: {', '.join(missing)}")
+        else:
+            with st.spinner(f"{action_label} in progress..."):
+                result = _mainframe_execute(operation, data_value.strip(), tso_user_id.strip(), tso_password)
+                st.session_state.mf_last_result = result
+
+    result = st.session_state.get("mf_last_result")
+    if result:
+        st.divider()
+        st.subheader("API response")
+
+        if not result.get("ok"):
+            st.error(result.get("error") or "Mainframe API request failed.")
+            if result.get("status_code") is not None:
+                st.caption(f"HTTP status: {result.get('status_code')}")
+            if result.get("raw_text"):
+                st.code(result.get("raw_text"), language="text")
+            if result.get("response_json") is not None:
+                st.json(result.get("response_json"))
+            return
+
+        response_json = result.get("response_json")
+        table_df = _mainframe_coerce_dataframe(response_json)
+        if table_df is not None and not table_df.empty:
+            st.dataframe(table_df)
+        elif isinstance(response_json, (dict, list)):
+            st.json(response_json)
+        else:
+            raw_text = result.get("raw_text", "")
+            if raw_text:
+                st.code(raw_text, language="text")
+            else:
+                st.info("No response body returned.")
+
 
 
 @st.cache_data(ttl="5m", show_spinner=False)
@@ -3877,11 +4129,12 @@ def main() -> None:
             "Required per connection: ORACLE_HOST, ORACLE_PORT, ORACLE_SERVICE, ORACLE_USER, ORACLE_PASSWORD."
         )
 
-    monitor_tab, playbook_tab, ubsr_tab, rbm_tab = st.tabs([
+    monitor_tab, playbook_tab, ubsr_tab, rbm_tab, mainframe_tab = st.tabs([
         "Server monitor",
         "Guided playbook",
         "UBSR validations",
         "RBM validations",
+        "Mainframe operations",
     ])
 
     with monitor_tab:
@@ -4012,6 +4265,9 @@ def main() -> None:
                         )
                     render_context_table("Derived RBM context", context_rows)
                     render_result_blocks(results, "rbm")
+
+    with mainframe_tab:
+        render_mainframe_operations_tab()
 
 if __name__ == "__main__":
     main()
