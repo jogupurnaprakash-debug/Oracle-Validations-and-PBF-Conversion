@@ -574,13 +574,15 @@ def render_pbf_conversion_tab() -> None:
 
     st.divider()
 
+    run_mode = st.segmented_control(
+        "Conversion mode",
+        options=["Single file", "Scheduler (multiple files)"],
+        default=st.session_state.get("pbf_run_mode", "Single file"),
+        key="pbf_run_mode",
+        help="Use scheduler mode to process multiple stream and iteration combinations in one trigger.",
+    )
+
     with st.form("pbf_conversion_form"):
-        run_mode = st.segmented_control(
-            "Conversion mode",
-            options=["Single file", "Scheduler (multiple files)"],
-            default="Single file",
-            help="Use scheduler mode to process multiple stream and iteration combinations in one trigger.",
-        )
 
         st.caption(
             "Filename format: {FILE_NAME}_{TAG}_{CYCLE}{STREAM}{ITERATION}_{TIMESTAMP}_V2_VB2B "
@@ -602,11 +604,11 @@ def render_pbf_conversion_tab() -> None:
             stream = col3.selectbox("Stream", options=["C", "E", "M"], index=0)
             iteration = col4.selectbox("Iteration", options=[str(i) for i in range(1, 10)], index=0)
         else:
-            scheduler_file_names_raw = st.text_input(
-                "File names (comma-separated)",
+            scheduler_file_names_raw = st.text_area(
+                "File names (comma/newline separated)",
                 value=file_name,
-                placeholder="AF_SADFEE, AF_ANOTHER",
-                help="Provide one or more file name prefixes for scheduler mode.",
+                placeholder="AF_SADFEE\nAF_ANOTHER\nAF_THIRD",
+                help="Provide one or more file name prefixes. You can separate by comma or new line.",
             )
 
             col3, col4 = st.columns([1, 2])
@@ -718,7 +720,9 @@ def render_pbf_conversion_tab() -> None:
                         status_box.update(label="PBF conversion failed", state="error", expanded=True)
             else:
                 scheduler_file_names = [
-                    token.strip() for token in scheduler_file_names_raw.split(",") if token.strip()
+                    token.strip()
+                    for token in re.split(r"[,\n]+", scheduler_file_names_raw)
+                    if token.strip()
                 ]
                 jobs = [
                     (f, s, i)
